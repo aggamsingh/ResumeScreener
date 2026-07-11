@@ -1,0 +1,93 @@
+# ══════════════════════════════════════════════════════════════
+#  Resume Screener — Docker Compose
+#
+#  Services:
+#    qdrant   → vector database (always running)
+#    api      → FastAPI screening service (always running)
+#    indexer  → one-shot CV indexer (run manually)
+#
+#  Commands:
+#    Start service:    docker compose up -d
+#    Index CVs:        docker compose run --rm indexer
+#    Stop service:     docker compose down
+#    View logs:        docker compose logs -f api
+# ══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Qdrant Vector Database ────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: resume_screener_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC (optional, kept for Qdrant dashboard)
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__TELEMETRY_DISABLED=true   # no phone-home
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── FastAPI Screening API ─────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: resume-screener:latest
+    container_name: resume_screener_api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override Qdrant host to use the Docker service name
+      - QDRANT_HOST=qdrant
+    volumes:
+      # CV folder: read-only access (indexer writes; API never modifies CVs)
+      - ${CV_FOLDER_PATH:-./cvs}:/app/cvs:ro
+      # State file: shared between api container and host
+      - ./data:/app/data
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── CV Indexer (one-shot, manual) ─────────────────────────────
+  # Run with:  docker compose run --rm indexer
+  # Uses the same image as the api service.
+  # Exits after indexing completes — not a persistent service.
+  indexer:
+    image: resume-screener:latest
+    container_name: resume_screener_indexer
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+    volumes:
+      - ${CV_FOLDER_PATH:-./cvs}:/app/cvs:ro
+      - ./data:/app/data
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    command: python -m indexer.run
+    profiles:
+      - indexer   # excluded from "docker compose up" by default
+
+# ── Named Volumes ─────────────────────────────────────────────
+volumes:
+  qdrant_data:
+    name: resume_screener_qdrant_data
+    # Qdrant data persists across container restarts and docker compose down.
+    # To reset the database: docker volume rm resume_screener_qdrant_data
