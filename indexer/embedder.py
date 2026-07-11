@@ -85,18 +85,30 @@ def embed_and_upsert(
         all_vectors.extend(batch_vectors)
 
     # ── Build Qdrant points ─────────────────────────────────────
+    # All metadata fields are stored in every chunk's payload.
+    # This means filtering and display work without a secondary DB lookup.
+    # None values are stored as None — the retriever handles nulls.
+    meta = parsed_cv.metadata
+    base_payload: dict = {
+        "candidate_id":   parsed_cv.candidate_id,
+        "name":           parsed_cv.name,
+        "cv_path":        parsed_cv.cv_path,
+        # Metadata fields (used for post-retrieval filtering and display)
+        "experience_years": meta.experience_years,          # int | None
+        "location":         meta.location,                  # canonical city | None
+        "location_raw":     meta.location_raw,              # raw extracted string | None
+        "skills":           meta.skills,                    # list[str]
+        "email":            meta.email,                     # str | None
+        "ocr_used":         parsed_cv.ocr_used,             # bool (diagnostics)
+    }
+
     points: list[PointStruct] = []
     for chunk_text, vector in zip(chunks, all_vectors):
         points.append(
             PointStruct(
                 id=str(uuid.uuid4()),
                 vector=vector,
-                payload={
-                    "candidate_id":  parsed_cv.candidate_id,
-                    "name":          parsed_cv.name,
-                    "cv_path":       parsed_cv.cv_path,
-                    "chunk_text":    chunk_text,
-                },
+                payload={**base_payload, "chunk_text": chunk_text},
             )
         )
 
