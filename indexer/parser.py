@@ -1,30 +1,62 @@
 """
-CV parsing: PDF and DOCX extraction, text chunking, and name heuristics.
+CV parsing: PDF and DOCX extraction, OCR fallback, text chunking,
+name heuristics, and metadata extraction.
 
 Supported formats: .pdf, .docx
-Unsupported formats: skipped with a log warning (never raises).
+  - PDF: pdfplumber first; falls back to Tesseract OCR if text layer
+    is empty or too short (configurable via ENABLE_OCR env var).
+  - DOCX: python-docx paragraph extraction.
+  - Other: skipped with a log warning (never raises).
 
 Chunking strategy: fixed word-count windows with overlap.
-This is intentionally simple and robust across 20,000+ heterogeneous CVs.
-Section-based parsing is fragile; fixed chunking is reliable.
+Chosen over section-based parsing for robustness across 20k
+heterogeneous CVs from different templates and tools.
 """
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from indexer.metadata import CVMetadata, extract_metadata
+
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".pdf", ".docx"})
 
 CHUNK_WORD_SIZE = 400   # words per chunk
-CHUNK_OVERLAP   = 50    # words of overlap between adjacent chunks
+CHUNK_OVERLAP   = 50    # word overlap between adjacent chunks
 
-# Keywords that indicate a line is a section header, not a name
+# Minimum number of characters for extracted text to be considered valid.
+# PDFs with fewer chars are treated as scanned and OCR is attempted.
+_MIN_TEXT_LENGTH = 100
+
+# Respect the ENABLE_OCR environment variable (default: true if packages available)
+_OCR_ENV = os.getenv("ENABLE_OCR", "true").lower()
+_OCR_REQUESTED = _OCR_ENV not in ("false", "0", "no", "off")
+
+# Try to import OCR packages; availability determines whether OCR runs
+try:
+    import pytesseract          # type: ignore
+    from pdf2image import convert_from_path  # type: ignore
+    from PIL import Image       # type: ignore
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
+
+OCR_ENABLED = _OCR_REQUESTED and _OCR_AVAILABLE
+
+if _OCR_REQUESTED and not _OCR_AVAILABLE:
+    logger.warning(
+        "ENABLE_OCR=true but pytesseract/pdf2image/Pillow are not installed. "
+        "Scanned PDFs will be skipped. Install OCR dependencies or set ENABLE_OCR=false."
+    )
+
+# Keywords that indicate a line is a section header, not a person's name
 _HEADER_KEYWORDS = frozenset({
     "resume", "cv", "curriculum", "vitae", "profile", "summary",
     "objective", "contact", "address", "education", "experience",
@@ -36,33 +68,32 @@ _HEADER_KEYWORDS = frozenset({
 
 @dataclass
 class ParsedCV:
-    """Result of parsing a single CV file."""
+    """Result of parsing a single CV file, including metadata."""
     candidate_id: str
-    name: str
-    cv_path: str
-    raw_text: str
-    chunks: list[str] = field(default_factory=list)
+    name:         str
+    cv_path:      str
+    raw_text:     str
+    metadata:     CVMetadata
+    chunks:       list[str] = field(default_factory=list)
+    ocr_used:     bool = False   # True if text was obtained via OCR
 
 
-# ── Internal Helpers ───────────────────────────────────────────────────────────
+# ── Name Extraction ────────────────────────────────────────────────────────────
 
 def _extract_name(text: str, filename_stem: str) -> str:
     """
-    Heuristic name extraction: look for a 2–4 word capitalised line
-    near the top of the CV. Falls back to a cleaned-up filename stem.
+    Heuristic: look for a 2–4 word title-cased line in the first 15 lines.
+    Falls back to a cleaned-up version of the filename stem.
     """
-    for line in text.splitlines()[:15]:          # Only inspect first 15 lines
+    for line in text.splitlines()[:15]:
         line = line.strip()
         if not line:
             continue
         words = line.split()
         if 2 <= len(words) <= 4:
-            # All words should start with a capital letter
             if all(w[0].isupper() for w in words if w and w[0].isalpha()):
-                # Reject obvious header lines
                 if not any(kw in line.lower() for kw in _HEADER_KEYWORDS):
-                    # Reject lines with special characters common in headers
-                    if not any(ch in line for ch in (":", "|", "/", "@", "–", "-")):
+                    if not any(ch in line for ch in (":", "|", "/", "@", "–", "-", ".")):
                         return line
 
     # Fallback: derive from filename
@@ -70,10 +101,16 @@ def _extract_name(text: str, filename_stem: str) -> str:
     return " ".join(w.capitalize() for w in stem.split())
 
 
-def _chunk_text(text: str, chunk_size: int = CHUNK_WORD_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+# ── Text Chunking ──────────────────────────────────────────────────────────────
+
+def _chunk_text(
+    text: str,
+    chunk_size: int = CHUNK_WORD_SIZE,
+    overlap:    int = CHUNK_OVERLAP,
+) -> list[str]:
     """
     Split text into overlapping fixed-size word chunks.
-    Empty or very short texts return a single chunk.
+    Short texts (≤ chunk_size words) return a single chunk.
     """
     words = text.split()
     if not words:
@@ -85,17 +122,17 @@ def _chunk_text(text: str, chunk_size: int = CHUNK_WORD_SIZE, overlap: int = CHU
     start = 0
     while start < len(words):
         end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
+        chunks.append(" ".join(words[start:end]))
         if end >= len(words):
             break
         start = end - overlap
-
     return chunks
 
 
-def _parse_pdf(path: Path) -> str:
-    """Extract plain text from a PDF using pdfplumber."""
+# ── PDF Parsing ────────────────────────────────────────────────────────────────
+
+def _parse_pdf_text_layer(path: Path) -> str:
+    """Extract text using pdfplumber (reads the PDF text layer)."""
     import pdfplumber  # type: ignore
 
     pages: list[str] = []
@@ -107,13 +144,73 @@ def _parse_pdf(path: Path) -> str:
     return "\n".join(pages)
 
 
+def _parse_pdf_ocr(path: Path) -> str:
+    """
+    Convert PDF pages to images and run Tesseract OCR.
+    Only called when the text layer is absent or too short.
+    Requires: tesseract-ocr (system), pytesseract, pdf2image, Pillow.
+    """
+    logger.info("Running OCR on %s (scanned PDF detected)", path.name)
+    pages = convert_from_path(str(path), dpi=200)  # 200 DPI balances speed and accuracy
+    texts: list[str] = []
+    for i, page_img in enumerate(pages, 1):
+        page_text = pytesseract.image_to_string(page_img, lang="eng")
+        if page_text.strip():
+            texts.append(page_text)
+        logger.debug("OCR page %d/%d: %d chars", i, len(pages), len(page_text))
+    return "\n".join(texts)
+
+
+def _parse_pdf(path: Path) -> tuple[str, bool]:
+    """
+    Parse a PDF file. Returns (text, ocr_used).
+
+    Strategy:
+      1. Try pdfplumber (reads text layer, fast, CPU-only)
+      2. If text is shorter than _MIN_TEXT_LENGTH AND OCR_ENABLED:
+         fall back to Tesseract OCR
+      3. Return whatever text we have (may be empty if all strategies fail)
+    """
+    text = _parse_pdf_text_layer(path)
+
+    if len(text.strip()) >= _MIN_TEXT_LENGTH:
+        return text, False   # Good text layer, no OCR needed
+
+    if not OCR_ENABLED:
+        if len(text.strip()) < _MIN_TEXT_LENGTH:
+            logger.warning(
+                "Very little text extracted from %s (%d chars). "
+                "This may be a scanned PDF. Set ENABLE_OCR=true to process it.",
+                path.name,
+                len(text.strip()),
+            )
+        return text, False
+
+    # Text layer insufficient — attempt OCR
+    try:
+        ocr_text = _parse_pdf_ocr(path)
+        if len(ocr_text.strip()) > len(text.strip()):
+            logger.info(
+                "OCR produced more text than text layer for %s (%d vs %d chars)",
+                path.name,
+                len(ocr_text.strip()),
+                len(text.strip()),
+            )
+            return ocr_text, True
+        return text, False
+    except Exception as e:
+        logger.warning("OCR failed for %s: %s — using text layer fallback", path.name, e)
+        return text, False
+
+
+# ── DOCX Parsing ──────────────────────────────────────────────────────────────
+
 def _parse_docx(path: Path) -> str:
-    """Extract plain text from a DOCX file."""
+    """Extract plain text from a DOCX file (paragraphs only)."""
     from docx import Document  # type: ignore
 
     doc = Document(str(path))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n".join(paragraphs)
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -123,12 +220,12 @@ def parse_file(path: Path, candidate_id: str) -> Optional[ParsedCV]:
     Parse a CV file into a ParsedCV object.
 
     Returns:
-        ParsedCV if the file was successfully parsed and contains text.
-        None if the file type is unsupported or the file yields no text.
+        ParsedCV  — if file was parsed and yielded usable text.
+        None      — if file type is unsupported or no text could be extracted.
 
     Raises:
-        Any exception from the underlying parser — the caller (run.py) is
-        responsible for catching, logging, and continuing to the next file.
+        Any parsing exception — the caller (indexer/run.py) is responsible
+        for catching, logging per-file errors, and continuing.
     """
     ext = path.suffix.lower()
 
@@ -136,27 +233,34 @@ def parse_file(path: Path, candidate_id: str) -> Optional[ParsedCV]:
         logger.warning("Unsupported file type skipped: %s (%s)", path.name, ext)
         return None
 
+    ocr_used = False
     if ext == ".pdf":
-        raw_text = _parse_pdf(path)
+        raw_text, ocr_used = _parse_pdf(path)
     else:  # .docx
         raw_text = _parse_docx(path)
 
-    if not raw_text or not raw_text.strip():
+    if not raw_text or len(raw_text.strip()) < _MIN_TEXT_LENGTH:
         logger.warning(
-            "No text extracted from %s — may be a scanned/image-only PDF. Skipping.",
+            "Insufficient text from %s (%d chars) — skipping. "
+            "If this is a scanned PDF, ensure ENABLE_OCR=true and Tesseract is installed.",
             path.name,
+            len(raw_text.strip()) if raw_text else 0,
         )
         return None
 
-    name = _extract_name(raw_text, path.stem)
-    chunks = _chunk_text(raw_text)
+    name     = _extract_name(raw_text, path.stem)
+    metadata = extract_metadata(raw_text)
+    chunks   = _chunk_text(raw_text)
 
     logger.debug(
-        "Parsed '%s' → name='%s', %d words, %d chunks",
-        path.name,
-        name,
-        len(raw_text.split()),
-        len(chunks),
+        "Parsed '%s' → name='%s', %d words, %d chunks, "
+        "exp=%s yrs, loc='%s', skills=%d, ocr=%s",
+        path.name, name,
+        len(raw_text.split()), len(chunks),
+        metadata.experience_years,
+        metadata.location or "unknown",
+        len(metadata.skills),
+        ocr_used,
     )
 
     return ParsedCV(
@@ -164,5 +268,7 @@ def parse_file(path: Path, candidate_id: str) -> Optional[ParsedCV]:
         name=name,
         cv_path=str(path),
         raw_text=raw_text,
+        metadata=metadata,
         chunks=chunks,
+        ocr_used=ocr_used,
     )
