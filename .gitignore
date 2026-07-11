@@ -1,0 +1,44 @@
+# ── Secrets ───────────────────────────────────────────
+.env
+
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Data / State ────────────────────────────────────────
+data/index_state.json
+data/*.json
+
+# ── CV Files (never commit real CVs) ───────────────────
+cvs/*
+!cvs/.gitkeep
+
+# ── Docker ─────────────────────────────────────────────
+*.log
+
+# ── OS ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
