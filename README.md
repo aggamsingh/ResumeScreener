@@ -1338,6 +1338,12 @@ A: CV content is sent to Groq/Gemini as part of the reranking prompt (CV excerpt
 **Q: Can I run this without a Groq API key?**
 A: Yes, but results will be lower quality. Without a valid Groq key, every request falls back to pure vector score ranking (no LLM reasoning). Set `LLM_PROVIDER=groq` and use an invalid key to trigger fallback mode intentionally.
 
+**Q: The documentation mentions 20,000 resumes. Can the system scale to 1 Lakh (100k) or 2 Lakh (200k) resumes?**
+A: Yes, without any architectural changes. Qdrant handles millions of vectors effortlessly using HNSW indexing, and the AI reranker only processes the top 90 matches regardless of database size, so API latency remains 3-8 seconds. The only bottlenecks are the *initial indexing time* and hardware. For 2 Lakh resumes, you will need:
+- **RAM:** 8GB to 16GB (to hold the Qdrant index in memory for fast retrieval).
+- **Disk Space:** ~200GB (to store the original PDFs/DOCXs) + 5GB for the Qdrant index.
+- **Patience:** The *first* run of the indexer could take 30–60 hours on a single CPU core. Subsequent incremental runs for new daily CVs will remain extremely fast.
+
 **Q: Can multiple users query the API simultaneously?**
 A: Yes. The API is async (uvicorn with FastAPI). The embedding model and Qdrant client are loaded once and reused across all requests. Practical concurrent capacity: 3-5 simultaneous requests on a modern CPU server before latency degrades.
 
