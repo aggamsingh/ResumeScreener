@@ -11,7 +11,15 @@ import logging
 import uuid
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, PointStruct, VectorParams
+from qdrant_client.http.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 from sentence_transformers import SentenceTransformer
 
 from indexer.parser import ParsedCV
@@ -82,6 +90,40 @@ def embed_and_upsert(
     if not chunks:
         logger.warning("No chunks for '%s' — skipping upsert", parsed_cv.name)
         return 0
+
+    candidate_id = parsed_cv.candidate_id
+
+    # ── Delete stale points before inserting new ones ───────────
+    # Each chunk gets a new uuid4() ID on every upsert, so without this
+    # step, re-indexing a modified CV would leave all old chunk vectors
+    # in Qdrant. Over time this causes duplicate results and stale data.
+    # We delete by candidate_id filter (stored in every chunk's payload)
+    # so the cleanup is atomic and type-safe.
+    try:
+        client.delete(
+            collection_name=collection_name,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="candidate_id",
+                            match=MatchValue(value=candidate_id),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+        logger.debug("Deleted stale points for candidate_id=%s", candidate_id)
+    except Exception as e:
+        # Non-fatal: log and continue. If delete fails, we still upsert
+        # the new points. Duplicates are bad but a failed upsert would be worse.
+        logger.warning(
+            "Could not delete stale points for '%s' (candidate_id=%s): %s",
+            parsed_cv.name,
+            candidate_id,
+            e,
+        )
 
     # ── Encode in batches ───────────────────────────────────────
     all_vectors: list[list[float]] = []
