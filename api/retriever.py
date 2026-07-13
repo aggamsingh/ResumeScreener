@@ -247,7 +247,7 @@ def retrieve_candidates(
 
     # ── Embed JD ─────────────────────────────────────────────────
     logger.info("Embedding job description (%d chars)", len(jd_text))
-    jd_vector: list[float] = model.encode(jd_text, convert_to_list=True)
+    jd_vector: list[float] = model.encode(jd_text).tolist()
 
     # ── Vector search ─────────────────────────────────────────────
     logger.info(

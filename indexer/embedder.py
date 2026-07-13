@@ -89,10 +89,9 @@ def embed_and_upsert(
         batch_chunks = chunks[i : i + BATCH_ENCODE]
         batch_vectors = model.encode(
             batch_chunks,
-            convert_to_list=True,
             show_progress_bar=False,
             batch_size=BATCH_ENCODE,
-        )
+        ).tolist()
         all_vectors.extend(batch_vectors)
 
     # ── Build Qdrant points ─────────────────────────────────────
