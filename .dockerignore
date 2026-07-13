@@ -1,0 +1,47 @@
+# ── Secrets — NEVER include in Docker image ───────────────────
+.env
+.env.*
+!.env.example
+
+# ── Version control ───────────────────────────────────────────
+.git
+.gitignore
+
+# ── Large data directories ────────────────────────────────────
+# CV files can be GBs — never bake into the image (mounted as volume)
+cvs/
+# Runtime state — generated, not source
+data/
+
+# ── Python artifacts ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Documentation (not needed at runtime) ────────────────────
+*.md
+!requirements.txt
+
+# ── IDE and agentic tool directories ─────────────────────────
+.idea/
+.vscode/
+.cursor/
+.agents/
+.gemini/
+
+# ── OS artifacts ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Testing ───────────────────────────────────────────────────
+htmlcov/
+.coverage
+.pytest_cache/
