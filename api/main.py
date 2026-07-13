@@ -14,6 +14,7 @@ Routes:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import sys
@@ -22,6 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
@@ -46,7 +48,9 @@ logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     # Auth
-    api_key: str
+    # min_length=1 ensures the service refuses to start with an empty API_KEY.
+    # Generate a strong key with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    api_key: str = Field(min_length=1)
 
     # Qdrant
     qdrant_host: str = "qdrant"
@@ -145,7 +149,7 @@ async def auth_middleware(request: Request, call_next):
     provided_key = request.headers.get("X-API-Key", "")
     expected_key = app.state.settings.api_key
 
-    if not provided_key or provided_key != expected_key:
+    if not provided_key or not hmac.compare_digest(provided_key, expected_key):
         logger.warning(
             "Rejected unauthenticated request: path=%s host=%s",
             request.url.path,
