@@ -30,6 +30,12 @@ GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 _LLM_TIMEOUT_SECONDS = 20
 
+# Maximum candidates sent to the LLM in a single prompt.
+# With 800-char excerpts + metadata, 15 candidates fit comfortably in
+# an 8k-token context window (llama-3.1-8b-instant, gemini-1.5-flash).
+# Sending more risks silent truncation or a token-limit error.
+_MAX_LLM_CANDIDATES = 15
+
 
 # ── Prompt Builder ─────────────────────────────────────────────────────────────
 
@@ -145,7 +151,17 @@ def rerank_candidates(
     if not candidates:
         return []
 
-    prompt = _build_prompt(jd_text, candidates, top_k)
+    # Cap the number of candidates sent to the LLM.
+    # Passing all retrieved candidates (up to top_k*3) can easily exceed
+    # the model's context window, causing silent truncation or API errors.
+    candidates_for_llm = candidates[:_MAX_LLM_CANDIDATES]
+    if len(candidates) > _MAX_LLM_CANDIDATES:
+        logger.debug(
+            "Capping LLM input: %d candidates → %d (MAX_LLM_CANDIDATES=%d)",
+            len(candidates), _MAX_LLM_CANDIDATES, _MAX_LLM_CANDIDATES,
+        )
+
+    prompt = _build_prompt(jd_text, candidates_for_llm, top_k)
 
     try:
         logger.info("Calling LLM reranker via provider='%s', model='%s'", LLM_PROVIDER, _get_model_name())
@@ -176,17 +192,49 @@ def rerank_candidates(
                 continue
 
             meta = lookup[cid]
+            try:
+                score = min(1.0, max(0.0, float(item.get("score", meta["best_score"]))))
+            except (TypeError, ValueError):
+                score = min(1.0, max(0.0, round(meta["best_score"], 4)))
             result.append(
                 Candidate(
                     candidate_id=cid,
                     name=meta["name"],
-                    score=min(1.0, max(0.0, float(item.get("score", meta["best_score"])))),
+                    score=score,
                     match_reasoning=str(item.get("reasoning", "")).strip(),
                     cv_path=meta["cv_path"],
                     metadata=CandidateMetadata(**meta.get("metadata", {})),
                     filter_flags=meta.get("filter_flags", []),
                 )
             )
+
+        # Backfill: if the LLM hallucinated IDs and returned fewer than top_k,
+        # fill remaining slots with the best vector-scored candidates not already included.
+        if len(result) < top_k:
+            used_ids = {c.candidate_id for c in result}
+            remaining = sorted(
+                [c for c in candidates if c["candidate_id"] not in used_ids],
+                key=lambda x: x["best_score"],
+                reverse=True,
+            )
+            for c in remaining[: top_k - len(result)]:
+                result.append(
+                    Candidate(
+                        candidate_id=c["candidate_id"],
+                        name=c["name"],
+                        score=min(1.0, max(0.0, round(c["best_score"], 4))),
+                        match_reasoning="Ranked by semantic similarity (LLM did not rank this candidate).",
+                        cv_path=c["cv_path"],
+                        metadata=CandidateMetadata(**c.get("metadata", {})),
+                        filter_flags=c.get("filter_flags", []),
+                    )
+                )
+            if len(result) > len(ranked_items[:top_k]):
+                logger.info(
+                    "Backfilled %d candidate(s) to reach top_k=%d",
+                    len(result) - len(ranked_items[:top_k]),
+                    top_k,
+                )
 
         return result
 
@@ -210,7 +258,11 @@ def _fallback_ranking(candidates: list[dict[str, Any]], top_k: int) -> list[Cand
         Candidate(
             candidate_id=c["candidate_id"],
             name=c["name"],
-            score=round(c["best_score"], 4),
+            # Clamp to [0.0, 1.0] — cosine scores can slightly exceed 1.0
+            # due to floating-point precision. Without clamping, Pydantic's
+            # le=1.0 constraint on Candidate.score raises a ValidationError,
+            # crashing the fallback path that is meant to be the safety net.
+            score=min(1.0, max(0.0, round(c["best_score"], 4))),
             match_reasoning="Ranked by semantic similarity (AI reranker temporarily unavailable).",
             cv_path=c["cv_path"],
             metadata=CandidateMetadata(**c.get("metadata", {})),
