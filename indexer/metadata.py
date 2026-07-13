@@ -195,11 +195,6 @@ def _extract_location(text: str) -> tuple[Optional[str], Optional[str]]:
         if re.search(r'\b' + re.escape(alias) + r'\b', header):
             return canonical, alias.title()
 
-    # ── Strategy 3: scan full text ──────────────────────────────
-    for alias, canonical in sorted(_CITY_ALIASES.items(), key=lambda x: -len(x[0])):
-        if re.search(r'\b' + re.escape(alias) + r'\b', text_lower):
-            return canonical, alias.title()
-
     return None, None
 
 
@@ -278,7 +273,7 @@ _SKILL_TAXONOMY: dict[str, str] = {
 
 # Compile a single regex that matches any skill keyword (word boundaries)
 _SKILL_PATTERN = re.compile(
-    r'\b(' + '|'.join(re.escape(k) for k in sorted(_SKILL_TAXONOMY, key=len, reverse=True)) + r')\b',
+    r'(?<![a-zA-Z0-9])(' + '|'.join(re.escape(k) for k in sorted(_SKILL_TAXONOMY, key=len, reverse=True)) + r')(?![a-zA-Z0-9])',
     re.IGNORECASE,
 )
 

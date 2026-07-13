@@ -93,7 +93,7 @@ def _extract_name(text: str, filename_stem: str) -> str:
         if 2 <= len(words) <= 4:
             if all(w[0].isupper() for w in words if w and w[0].isalpha()):
                 if not any(kw in line.lower() for kw in _HEADER_KEYWORDS):
-                    if not any(ch in line for ch in (":", "|", "/", "@", "–", "-", ".")):
+                    if not any(ch in line for ch in (":", "|", "/", "@", "–", "!", "?")):
                         return line
 
     # Fallback: derive from filename
@@ -150,14 +150,25 @@ def _parse_pdf_ocr(path: Path) -> str:
     Only called when the text layer is absent or too short.
     Requires: tesseract-ocr (system), pytesseract, pdf2image, Pillow.
     """
+    from pdf2image.info import pdfinfo_from_path # type: ignore
+    
     logger.info("Running OCR on %s (scanned PDF detected)", path.name)
-    pages = convert_from_path(str(path), dpi=200)  # 200 DPI balances speed and accuracy
+    try:
+        info = pdfinfo_from_path(str(path))
+        num_pages = int(info.get("Pages", 1))
+    except Exception:
+        num_pages = 1
+        
     texts: list[str] = []
-    for i, page_img in enumerate(pages, 1):
+    for i in range(1, num_pages + 1):
+        pages = convert_from_path(str(path), dpi=200, first_page=i, last_page=i)
+        if not pages:
+            continue
+        page_img = pages[0]
         page_text = pytesseract.image_to_string(page_img, lang="eng")
         if page_text.strip():
             texts.append(page_text)
-        logger.debug("OCR page %d/%d: %d chars", i, len(pages), len(page_text))
+        logger.debug("OCR page %d/%d: %d chars", i, num_pages, len(page_text))
     return "\n".join(texts)
 
 
@@ -206,11 +217,20 @@ def _parse_pdf(path: Path) -> tuple[str, bool]:
 # ── DOCX Parsing ──────────────────────────────────────────────────────────────
 
 def _parse_docx(path: Path) -> str:
-    """Extract plain text from a DOCX file (paragraphs only)."""
+    """Extract plain text from a DOCX file (paragraphs and tables)."""
     from docx import Document  # type: ignore
 
     doc = Document(str(path))
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    texts = []
+    for p in doc.paragraphs:
+        if p.text.strip():
+            texts.append(p.text)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    texts.append(cell.text)
+    return "\n".join(texts)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
