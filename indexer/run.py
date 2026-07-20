@@ -105,18 +105,18 @@ def main() -> None:
     # ── Connect to Qdrant ──────────────────────────────────────────
     logger.info("Connecting to Qdrant...")
     try:
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
+        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=3)
         qdrant.get_collections()  # connection test
-        logger.info("Qdrant connected")
+        logger.info("Qdrant server connected")
     except Exception as e:
-        logger.error(
-            "Cannot connect to Qdrant at %s:%d — %s\n"
-            "  → Make sure Qdrant is running: docker compose up -d qdrant",
+        logger.warning(
+            "Could not connect to Qdrant at %s:%d (%s). Falling back to embedded local storage at ./data/qdrant_db",
             QDRANT_HOST,
             QDRANT_PORT,
             e,
         )
-        sys.exit(1)
+        qdrant = QdrantClient(path="./data/qdrant_db")
+        logger.info("Embedded local Qdrant database initialized")
 
     # ── Load embedding model ───────────────────────────────────────
     # Model must be loaded before ensure_collection so we can pass

@@ -211,3 +211,32 @@ class HealthResponse(BaseModel):
     qdrant_connected: bool = Field(description="Whether Qdrant is reachable")
     model_loaded:     bool = Field(description="Whether the embedding model is loaded")
     version:          str  = Field(default="1.0.0")
+
+
+class ChatHistoryItem(BaseModel):
+    role: str = Field(description="Role: 'user' or 'model'")
+    content: str = Field(description="Message content")
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(description="User prompt / question")
+    history: Optional[list[ChatHistoryItem]] = Field(default=[], description="Previous chat messages")
+
+
+class ChatResponse(BaseModel):
+    reply: str = Field(description="AI response text in markdown")
+
+
+class SyncRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    site_url: Optional[str] = None
+    folder_path: Optional[str] = None
+
+
+class SyncResponse(BaseModel):
+    status: str = Field(description="Status: 'success' or 'error'")
+    files_processed: int = Field(default=0, description="Total files processed")
+    candidates_added: int = Field(default=0, description="New CVs added and indexed")
+    message: str = Field(description="Summary message")

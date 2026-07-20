@@ -20,7 +20,8 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import Field
@@ -28,9 +29,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
-from api.models import HealthResponse, ScreeningRequest, ScreeningResponse
+from api.models import (
+    ChatRequest,
+    ChatResponse,
+    HealthResponse,
+    ScreeningRequest,
+    ScreeningResponse,
+    SyncRequest,
+    SyncResponse,
+)
 from api.retriever import retrieve_candidates, build_candidate_response
 from api.reranker import rerank_candidates
+from api.sharepoint import sync_sharepoint_resumes
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -54,6 +64,9 @@ class Settings(BaseSettings):
     default_top_k: int = 10
     retrieval_top_n: int = 30
     embedding_model: str = "all-MiniLM-L6-v2"
+
+    # CV Storage
+    cv_folder_path: str = "./cvs"
 
     # Server
     allowed_origins: str = "*"
@@ -79,13 +92,23 @@ async def lifespan(app: FastAPI):
     logger.info("Embedding model ready")
 
     # Initialize Qdrant client
-    logger.info("Connecting to Qdrant at %s:%d", settings.qdrant_host, settings.qdrant_port)
-    app.state.qdrant = QdrantClient(
-        host=settings.qdrant_host,
-        port=settings.qdrant_port,
-        timeout=10,
-    )
-    logger.info("Qdrant client ready")
+    try:
+        logger.info("Connecting to Qdrant at %s:%d", settings.qdrant_host, settings.qdrant_port)
+        client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=3)
+        client.get_collections()
+        app.state.qdrant = client
+        logger.info("Connected to Qdrant server successfully")
+    except Exception as e:
+        logger.warning("Could not connect to Qdrant server at %s:%d (%s). Falling back to embedded local storage at ./data/qdrant_db", settings.qdrant_host, settings.qdrant_port, e)
+        app.state.qdrant = QdrantClient(path="./data/qdrant_db")
+        logger.info("Embedded local Qdrant database initialized")
+
+    try:
+        from indexer.embedder import ensure_collection
+        vector_dim = app.state.model.get_sentence_embedding_dimension()
+        ensure_collection(app.state.qdrant, settings.qdrant_collection, vector_dim)
+    except Exception as exc:
+        logger.warning("Could not auto-create collection '%s': %s", settings.qdrant_collection, exc)
 
     logger.info("API is ready to serve requests")
     logger.info("=" * 55)
@@ -123,14 +146,18 @@ def create_app() -> FastAPI:
     # Store settings on app so lifespan and routes can access them
     app.state.settings = settings
 
-    # CORS
-    origins = [o.strip() for o in settings.allowed_origins.split(",")]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
-        allow_methods=["GET", "POST"],
+        allow_origin_regex=r"https?://.*",
+        allow_credentials=True,
+        allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Serve downloaded CVs statically so they can be embedded in frontend iframes without auth/SharePoint issues
+    cv_folder = getattr(settings, "cv_folder_path", "./cvs")
+    if not os.path.exists(cv_folder):
+        os.makedirs(cv_folder, exist_ok=True)
+    app.mount("/api/v1/cvs", StaticFiles(directory=cv_folder), name="cvs")
 
     return app
 
@@ -141,12 +168,12 @@ app = create_app()
 
 # Prefix-match so /docs, /docs/, and Swagger asset sub-paths all pass through.
 # FastAPI redirects /docs → /docs/ internally; exact-match blocked the redirect target.
-_PUBLIC_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json")
+_PUBLIC_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/api/v1/cvs")
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if any(request.url.path.startswith(p) for p in _PUBLIC_PREFIXES):
+    if request.method == "OPTIONS" or any(request.url.path.startswith(p) for p in _PUBLIC_PREFIXES):
         return await call_next(request)
 
     provided_key = request.headers.get("X-API-Key", "")
@@ -282,3 +309,165 @@ async def screen_resumes(request: Request, body: ScreeningRequest):
         n_filtered_out,
     )
     return ScreeningResponse(candidates=ranked, total_filtered_out=n_filtered_out)
+
+
+@app.post(
+    "/api/v1/chat",
+    response_model=ChatResponse,
+    tags=["Chat"],
+    summary="Local AI Recruiter Agent chat endpoint",
+)
+async def chat_agent(request: Request, body: ChatRequest):
+    """
+    Local AI Recruiter Copilot.
+    Processes user query against indexed resumes using local vector retrieval
+    and local NLP analysis without requiring external API keys.
+    """
+    settings: Settings = request.app.state.settings
+    query_text = body.message.strip()
+
+    if not query_text:
+        return ChatResponse(reply="Please provide a query or question about your candidates.")
+
+    # Retrieve candidates using local MiniLM embedding model + Qdrant vector index
+    try:
+        raw_candidates, _ = retrieve_candidates(
+            qdrant_client=request.app.state.qdrant,
+            model=request.app.state.model,
+            jd_text=query_text,
+            collection_name=settings.qdrant_collection,
+            top_n=10,
+        )
+    except Exception as exc:
+        logger.error("Chat candidate retrieval failed: %s", exc, exc_info=True)
+        raw_candidates = []
+
+    if not raw_candidates:
+        reply_text = (
+            f"Unfortunately, I couldn't find any candidates matching your query **\"{query_text}\"** "
+            "in the current database search results.\n\n"
+            "It appears that no profiles matching those specific qualifications were returned from the semantic vector database. "
+            "Make sure your resume files have been indexed into the vector database."
+        )
+        return ChatResponse(reply=reply_text)
+
+    # Format retrieved candidate details intelligently into a local AI recruiter response
+    candidates = [build_candidate_response(c) for c in raw_candidates[:5]]
+
+    reply_lines = [
+        f"Based on your query **\"{query_text}\"**, I analyzed the candidate database and retrieved the top matching profiles:\n"
+    ]
+
+    for idx, cand in enumerate(candidates, 1):
+        name = cand.get("name") or "Unknown Candidate"
+        metadata = cand.get("metadata", {})
+        exp = f"{metadata.get('experience_years')} years exp" if metadata.get('experience_years') is not None else "Experience N/A"
+        loc = metadata.get("location") or "Location N/A"
+        skills_list = metadata.get("skills", [])
+        skills = ", ".join(skills_list[:8]) if skills_list else "Skills extracted in CV"
+        
+        # Use best_chunk_text or summary as reasoning fallback
+        reason = cand.get("best_chunk_text") or "Candidate profile matched via semantic search."
+        if len(reason) > 200:
+            reason = reason[:200] + "..."
+
+        reply_lines.append(
+            f"### {idx}. **{name}**\n"
+            f"- **Experience & Location:** {exp} | {loc}\n"
+            f"- **Key Skills:** {skills}\n"
+            f"- **Match Overview:** {reason}\n"
+        )
+
+    reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
+
+    return ChatResponse(reply="\n".join(reply_lines))
+
+
+def run_sharepoint_sync_task(
+    body: SyncRequest,
+    cv_folder_path: str,
+    qdrant_client,
+    sentence_transformer_model,
+    collection_name: str,
+):
+    logger.info("Starting background SharePoint sync and indexing task...")
+    try:
+        from pathlib import Path
+        from indexer.parser import parse_file
+        from indexer.utils import get_candidate_id
+        from indexer.embedder import embed_and_upsert, ensure_collection
+
+        cv_dir = Path(cv_folder_path)
+        existing_files = [
+            f for f in cv_dir.glob("*")
+            if f.suffix.lower() in (".pdf", ".docx", ".doc", ".txt") and not f.name.startswith(".")
+        ]
+
+        if existing_files:
+            logger.info("Found %d existing local files. Indexing sequentially...", len(existing_files))
+            vector_dim = sentence_transformer_model.get_sentence_embedding_dimension()
+            ensure_collection(qdrant_client, collection_name, vector_dim)
+
+            for idx, cv_file in enumerate(existing_files, 1):
+                try:
+                    cand_id = get_candidate_id(cv_file)
+                    cv_obj = parse_file(cv_file, cand_id)
+                    if cv_obj:
+                        embed_and_upsert(qdrant_client, sentence_transformer_model, cv_obj, collection_name)
+                        if idx % 10 == 0 or idx == len(existing_files):
+                            logger.info("Indexed CV progress: %d/%d files", idx, len(existing_files))
+                except Exception as p_err:
+                    logger.warning("Error parsing/indexing CV %s: %s", cv_file.name, p_err)
+
+        # Instant callback to index newly downloaded files immediately
+        def on_download(file_path: Path):
+            try:
+                cand_id = get_candidate_id(file_path)
+                cv_obj = parse_file(file_path, cand_id)
+                if cv_obj:
+                    vector_dim = sentence_transformer_model.get_sentence_embedding_dimension()
+                    ensure_collection(qdrant_client, collection_name, vector_dim)
+                    embed_and_upsert(qdrant_client, sentence_transformer_model, cv_obj, collection_name)
+                    logger.info("Instantly indexed newly downloaded CV: %s", file_path.name)
+            except Exception as index_err:
+                logger.warning("Instant index failed for %s: %s", file_path.name, index_err)
+
+        files_processed, new_downloaded = sync_sharepoint_resumes(
+            tenant_id=body.tenant_id,
+            client_id=body.client_id,
+            client_secret=body.client_secret,
+            target_dir=cv_folder_path,
+            on_file_downloaded=on_download,
+        )
+
+        logger.info("Background SharePoint sync completed. Files processed: %d, New downloaded: %d", files_processed, new_downloaded)
+    except Exception as exc:
+        logger.error("Background SharePoint sync task failed: %s", exc, exc_info=True)
+
+
+@app.post(
+    "/api/v1/sync",
+    response_model=SyncResponse,
+    tags=["Sync"],
+    summary="Sync candidate resumes from SharePoint and index them into Qdrant",
+)
+async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, background_tasks: BackgroundTasks):
+    """
+    Downloads candidate resumes directly from SharePoint via Microsoft Graph API,
+    parses them, and indexes them into Qdrant using the local embedding model in the background.
+    """
+    settings: Settings = request.app.state.settings
+    background_tasks.add_task(
+        run_sharepoint_sync_task,
+        body=body,
+        cv_folder_path=getattr(settings, "cv_folder_path", "./cvs"),
+        qdrant_client=request.app.state.qdrant,
+        sentence_transformer_model=request.app.state.model,
+        collection_name=settings.qdrant_collection,
+    )
+    return SyncResponse(
+        status="success",
+        files_processed=0,
+        candidates_added=0,
+        message="SharePoint sync and indexing started in the background. Resumes will appear in the system as they are downloaded and processed.",
+    )

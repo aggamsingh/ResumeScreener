@@ -255,12 +255,16 @@ def retrieve_candidates(
         collection_name,
         actual_top_n,
     )
-    hits = qdrant_client.search(
-        collection_name=collection_name,
-        query_vector=jd_vector,
-        limit=actual_top_n,
-        with_payload=True,
-    )
+    try:
+        hits = qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=jd_vector,
+            limit=actual_top_n,
+            with_payload=True,
+        )
+    except Exception as e:
+        logger.warning("Qdrant search error or collection empty: %s", e)
+        return [], 0
 
     if not hits:
         logger.warning("Qdrant returned zero results — is the collection indexed?")
