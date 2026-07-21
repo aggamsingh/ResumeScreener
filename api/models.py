@@ -93,7 +93,7 @@ class ScreeningRequest(BaseModel):
 
     job_description: str = Field(
         ...,
-        min_length=20,
+        min_length=1,
         max_length=50000,  # ~10 pages; prevents OOM on runaway inputs
         description="Full text of the job description to screen against",
     )
@@ -240,3 +240,12 @@ class SyncResponse(BaseModel):
     files_processed: int = Field(default=0, description="Total files processed")
     candidates_added: int = Field(default=0, description="New CVs added and indexed")
     message: str = Field(description="Summary message")
+
+
+class JDRequest(BaseModel):
+    job_title: str = Field(description="The job title to generate description and keywords for")
+
+
+class JDResponse(BaseModel):
+    job_description: str = Field(description="Synthesized job description")
+    keywords: list[str] = Field(default_factory=list, description="Extracted keywords/skills")

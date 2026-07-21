@@ -18,12 +18,14 @@ import hmac
 import logging
 import os
 import sys
+import re
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from qdrant_client import QdrantClient
@@ -37,6 +39,8 @@ from api.models import (
     ScreeningResponse,
     SyncRequest,
     SyncResponse,
+    JDRequest,
+    JDResponse,
 )
 from api.retriever import retrieve_candidates, build_candidate_response
 from api.reranker import rerank_candidates
@@ -153,12 +157,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    # Serve downloaded CVs statically so they can be embedded in frontend iframes without auth/SharePoint issues
-    cv_folder = getattr(settings, "cv_folder_path", "./cvs")
-    if not os.path.exists(cv_folder):
-        os.makedirs(cv_folder, exist_ok=True)
-    app.mount("/api/v1/cvs", StaticFiles(directory=cv_folder), name="cvs")
-
     return app
 
 
@@ -196,6 +194,57 @@ async def auth_middleware(request: Request, call_next):
         )
 
     return await call_next(request)
+
+
+# ── Custom Static Files Router ──────────────────────────────────────────────────
+
+@app.get("/api/v1/cvs/{filename:path}", tags=["CVs"], summary="Fetch local CV file")
+async def get_cv_file(filename: str):
+    """
+    Serves CV files statically, supporting:
+      1. Exact match
+      2. URL decoded match
+      3. Cleaned filename match (removes 34-char item_id prefix)
+      4. Fallback search (finds file regardless of stored/local prefix discrepancy)
+    """
+    cv_folder = Path(app.state.settings.cv_folder_path)
+    
+    # Strip leading 'cvs/' or 'cvs\' prefix if present
+    filename = re.sub(r"^cvs[/\\]", "", filename)
+    
+    # 1. Try exact match first
+    exact_path = cv_folder / filename
+    if exact_path.is_file():
+        return FileResponse(exact_path)
+        
+    # 2. Try URL decoded exact match
+    from urllib.parse import unquote
+    decoded_filename = re.sub(r"^cvs[/\\]", "", unquote(filename))
+    decoded_path = cv_folder / decoded_filename
+    if decoded_path.is_file():
+        return FileResponse(decoded_path)
+        
+    # 3. Try removing 34-character ID prefix from requested filename
+    cleaned_filename = re.sub(r"(^|/|\\)([A-Z0-9]{34})_", r"\1", decoded_filename)
+    cleaned_path = cv_folder / cleaned_filename
+    if cleaned_path.is_file():
+        return FileResponse(cleaned_path)
+        
+    # 4. Try removing ID prefix from actual files in the folder (fallback search)
+    search_name = cleaned_filename.lower()
+    for f in cv_folder.glob("**/*"):
+        if f.is_file():
+            f_cleaned = re.sub(r"([A-Z0-9]{34})_", "", f.name).lower()
+            if f_cleaned == search_name or f.name.lower() == search_name:
+                return FileResponse(f)
+                
+            # Handle mismatch in position prefixes (e.g., "Position_File.pdf" vs "File.pdf")
+            f_base = os.path.splitext(f_cleaned)[0]
+            search_base = os.path.splitext(search_name)[0]
+            if len(f_base) > 5 and (search_base.endswith(f_base) or f_base.endswith(search_base)):
+                return FileResponse(f)
+                
+    raise HTTPException(status_code=404, detail="CV file not found")
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -470,4 +519,27 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
         files_processed=0,
         candidates_added=0,
         message="SharePoint sync and indexing started in the background. Resumes will appear in the system as they are downloaded and processed.",
+    )
+
+
+@app.post(
+    "/api/v1/generate-jd",
+    response_model=JDResponse,
+    tags=["AI Utility"],
+    summary="Generate Job Description and keywords offline",
+)
+async def generate_job_description(request: Request, payload: JDRequest):
+    """
+    Offline local generation of Job Descriptions and keywords using Qwen2.5-0.5B local LLM.
+    """
+    title = payload.job_title.strip()
+    
+    from api.local_llm import generate_local_jd
+    
+    logger.info("Generating local dynamic Job Description using Qwen-0.5B model for: %s", title)
+    result = generate_local_jd(title)
+    
+    return JDResponse(
+        job_description=result.get("job_description", ""),
+        keywords=result.get("keywords", [])
     )

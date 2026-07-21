@@ -273,7 +273,7 @@ def retrieve_candidates(
     # ── Deduplicate ───────────────────────────────────────────────
     candidates = _deduplicate(hits)
     logger.info(
-        "Retrieved %d chunks → %d unique candidates after deduplication",
+        "Retrieved %d chunks -> %d unique candidates after deduplication",
         len(hits),
         len(candidates),
     )
