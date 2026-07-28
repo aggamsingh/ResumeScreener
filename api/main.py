@@ -14,14 +14,18 @@ Routes:
 """
 from __future__ import annotations
 
+# Import mock_grpc first to bypass blocked cygrpc DLL under restrictive environment policies
+import mock_grpc
+
+
 import hmac
-import logging
+import logging  
 import os
 import sys
 import re
 from pathlib import Path
 from contextlib import asynccontextmanager
-
+    
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware

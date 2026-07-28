@@ -22,8 +22,8 @@ ENV/
 .ruff_cache/
 
 # ── Data / State ────────────────────────────────────────
-data/index_state.json
-data/*.json
+data/*
+!data/.gitkeep
 
 # ── CV Files (never commit real CVs) ───────────────────
 cvs/*

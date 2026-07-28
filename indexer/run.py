@@ -13,6 +13,10 @@ logs them, and continues. Writes index_state.json atomically on exit.
 """
 from __future__ import annotations
 
+# Import mock_grpc first to bypass blocked cygrpc DLL under restrictive environment policies
+import mock_grpc
+
+
 import logging
 import os
 import sys
