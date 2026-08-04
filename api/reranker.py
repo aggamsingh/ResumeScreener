@@ -119,7 +119,7 @@ def _call_gemini(prompt: str) -> str:
 
     response = _gemini_model.generate_content(
         prompt,
-        generation_config=_genai_module.GenerationConfig(temperature=0.1),
+        generation_config={"temperature": 0.1},
         request_options={"timeout": LLM_TIMEOUT},
     )
     return response.text or ""
@@ -279,3 +279,41 @@ def _fallback_ranking(candidates: list[dict[str, Any]], top_k: int) -> list[Cand
         )
         for c in sorted_candidates[:top_k]
     ]
+
+
+def generate_llm_response(prompt: str, gemini_api_key_override: str | None = None) -> str:
+    """
+    Calls the configured LLM (Groq or Gemini) to generate text for a given prompt.
+    Supports overriding the Gemini API key (useful if client sends X-Gemini-API-Key).
+    """
+    provider = LLM_PROVIDER
+    
+    # If a Gemini API key override is provided, force Gemini provider
+    if gemini_api_key_override:
+        provider = "gemini"
+        
+    logger.info("Calling LLM chat/generation via provider='%s'", provider)
+    
+    try:
+        if provider == "groq":
+            return _call_groq(prompt)
+        elif provider == "gemini":
+            if gemini_api_key_override:
+                import google.generativeai as genai
+                # Configure with the dynamic key
+                genai.configure(api_key=gemini_api_key_override)
+                model = genai.GenerativeModel(GEMINI_MODEL)
+                response = model.generate_content(
+                    prompt,
+                    generation_config={"temperature": 0.7},
+                    request_options={"timeout": LLM_TIMEOUT},
+                )
+                return response.text or ""
+            else:
+                return _call_gemini(prompt)
+        else:
+            raise ValueError(f"Unknown LLM_PROVIDER='{provider}'")
+    except Exception as exc:
+        logger.error("LLM text generation failed: %s", exc)
+        raise exc
+

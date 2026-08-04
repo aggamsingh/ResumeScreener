@@ -47,7 +47,7 @@ from api.models import (
     JDResponse,
 )
 from api.retriever import retrieve_candidates, build_candidate_response
-from api.reranker import rerank_candidates
+from api.reranker import rerank_candidates, generate_llm_response
 from api.sharepoint import sync_sharepoint_resumes
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -374,7 +374,7 @@ async def chat_agent(request: Request, body: ChatRequest):
     """
     Local AI Recruiter Copilot.
     Processes user query against indexed resumes using local vector retrieval
-    and local NLP analysis without requiring external API keys.
+    and local NLP analysis, with fallback to standard template if LLM is unavailable.
     """
     settings: Settings = request.app.state.settings
     query_text = body.message.strip()
@@ -395,7 +395,65 @@ async def chat_agent(request: Request, body: ChatRequest):
         logger.error("Chat candidate retrieval failed: %s", exc, exc_info=True)
         raw_candidates = []
 
-    if not raw_candidates:
+    # Format candidate context details for the LLM
+    candidates = [build_candidate_response(c) for c in raw_candidates[:8]]
+    candidates_context = ""
+    for idx, cand in enumerate(candidates, 1):
+        name = cand.get("name") or "Unknown Candidate"
+        metadata = cand.get("metadata", {})
+        exp = f"{metadata.get('experience_years')} years" if metadata.get('experience_years') is not None else "N/A"
+        loc = metadata.get("location") or "N/A"
+        skills = ", ".join(metadata.get("skills", []))
+        cv_excerpt = cand.get("best_chunk_text") or ""
+        candidates_context += (
+            f"Candidate {idx}:\n"
+            f"ID: {cand.get('candidate_id')}\n"
+            f"Name: {name}\n"
+            f"Experience: {exp}\n"
+            f"Location: {loc}\n"
+            f"Skills: {skills}\n"
+            f"Resume Excerpt:\n{cv_excerpt[:800]}\n"
+            f"-----------------\n"
+        )
+
+    # Format history context
+    history_context = ""
+    if body.history:
+        for item in body.history:
+            role_name = "User" if item.role == "user" else "Assistant"
+            history_context += f"{role_name}: {item.content}\n"
+
+    # Construct LLM prompt
+    prompt = f"""You are "Aryan", a smart and helpful AI Recruiter Copilot at TalentMatch.
+You help recruitment and HR teams evaluate candidates, compare skillsets, check locations, draft screening emails/invitations, and answer recruiting questions.
+
+Below is a list of the top candidate profiles retrieved from our vector database that match the user's current query:
+{candidates_context}
+
+INSTRUCTIONS:
+1. When answering questions about candidates, use the candidate context provided above.
+2. If the user asks for a template (like a screening invite email, reject email, etc.), draft a professional template using the details of the candidate they are talking about.
+3. If the user's message is a general greeting or unrelated recruiting question, answer it professionally.
+4. IMPORTANT: Always refer to candidates by their exact name as listed in the context.
+5. Keep your tone professional, supportive, and conversational. Use markdown formatting.
+
+Conversation History:
+{history_context}
+User: {query_text}
+Assistant:"""
+
+    # Check for dynamic client-supplied Gemini key header
+    gemini_key_override = request.headers.get("X-Gemini-API-Key", "").strip() or None
+
+    try:
+        reply_text = generate_llm_response(prompt, gemini_api_key_override=gemini_key_override)
+        if reply_text and reply_text.strip():
+            return ChatResponse(reply=reply_text.strip())
+    except Exception as llm_err:
+        logger.warning("Failed to get conversational response from LLM: %s. Falling back to template.", llm_err)
+
+    # Fallback to template response
+    if not candidates:
         reply_text = (
             f"Unfortunately, I couldn't find any candidates matching your query **\"{query_text}\"** "
             "in the current database search results.\n\n"
@@ -404,22 +462,17 @@ async def chat_agent(request: Request, body: ChatRequest):
         )
         return ChatResponse(reply=reply_text)
 
-    # Format retrieved candidate details intelligently into a local AI recruiter response
-    candidates = [build_candidate_response(c) for c in raw_candidates[:5]]
-
     reply_lines = [
         f"Based on your query **\"{query_text}\"**, I analyzed the candidate database and retrieved the top matching profiles:\n"
     ]
 
-    for idx, cand in enumerate(candidates, 1):
+    for idx, cand in enumerate(candidates[:5], 1):
         name = cand.get("name") or "Unknown Candidate"
         metadata = cand.get("metadata", {})
         exp = f"{metadata.get('experience_years')} years exp" if metadata.get('experience_years') is not None else "Experience N/A"
         loc = metadata.get("location") or "Location N/A"
         skills_list = metadata.get("skills", [])
         skills = ", ".join(skills_list[:8]) if skills_list else "Skills extracted in CV"
-        
-        # Use best_chunk_text or summary as reasoning fallback
         reason = cand.get("best_chunk_text") or "Candidate profile matched via semantic search."
         if len(reason) > 200:
             reason = reason[:200] + "..."
@@ -432,7 +485,6 @@ async def chat_agent(request: Request, body: ChatRequest):
         )
 
     reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
-
     return ChatResponse(reply="\n".join(reply_lines))
 
 
