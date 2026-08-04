@@ -52,13 +52,19 @@ SentenceTransformer('all-MiniLM-L6-v2'); \
 print('Model ready.')"
 
 # ── Application code ────────────────────────────────────────────
+# mock_grpc.py is a top-level module and the FIRST import in both api/main.py and
+# indexer/run.py. Leaving it out made every container exit immediately with
+# "ModuleNotFoundError: No module named 'mock_grpc'".
+COPY mock_grpc.py ./
 COPY api/      ./api/
 COPY indexer/  ./indexer/
 
-# Persistent directories (mounted from host via docker-compose volumes)
-RUN mkdir -p cvs data
+# Persistent directories (mounted from host via docker-compose volumes).
+# chown: the API writes here as appuser — SharePoint sync downloads into cvs/,
+# and the embedded-Qdrant fallback opens data/qdrant_db for writing. Root-owned
+# directories made both fail with EACCES.
+RUN mkdir -p cvs data && chown -R appuser cvs data
 
-# Switch to non-root user before copying app code
 USER appuser
 
 # ── Default command (API service) ───────────────────────────────

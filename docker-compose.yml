@@ -49,11 +49,20 @@ services:
     environment:
       # Override Qdrant host to use the Docker service name
       - QDRANT_HOST=qdrant
+      # CV_FOLDER_PATH in .env is a HOST path (e.g. C:/HR/Resumes) and is used
+      # as the bind-mount source below. Inside the container that path does not
+      # exist — the mount always lands on /app/cvs, so override it here.
+      - CV_FOLDER_PATH=/app/cvs
       # OCR for scanned PDFs — set to false in .env to disable
       - ENABLE_OCR=${ENABLE_OCR:-true}
     volumes:
-      # State file: shared between api container and host (read-only for API)
-      - ./data:/app/data:ro
+      # CV files: the API both serves them (/api/v1/cvs) and writes to them
+      # (SharePoint sync downloads here). Without this mount the API sees an
+      # empty cvs/ folder and every downloaded resume dies with the container.
+      - ${CV_FOLDER_PATH:-./cvs}:/app/cvs
+      # State + embedded-Qdrant fallback. Must be writable: when the Qdrant
+      # server is unreachable the API opens ./data/qdrant_db for writing.
+      - ./data:/app/data
     depends_on:
       qdrant:
         condition: service_healthy
@@ -78,6 +87,10 @@ services:
       - .env
     environment:
       - QDRANT_HOST=qdrant
+      # See the api service: the mount source is a host path, the mount target
+      # is always /app/cvs. Without this override the indexer exits with
+      # "CV folder not found" whenever CV_FOLDER_PATH is not ./cvs.
+      - CV_FOLDER_PATH=/app/cvs
       - ENABLE_OCR=${ENABLE_OCR:-true}
     volumes:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs:ro

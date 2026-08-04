@@ -29,7 +29,16 @@ Pillow>=11.3.0
 
 # LLM rerankers (both installed; only the configured one is called at runtime)
 groq~=0.9.0
-google-generativeai~=0.7.0
+# Gemini is called over plain REST with `requests` (see api/reranker._call_gemini):
+# the google-generativeai SDK pulls in grpc, which mock_grpc.py has to stub out
+# here, and the two are not compatible. No SDK needed.
+
+# Local JD generation (Qwen2.5-0.5B) — api/local_llm.py imports transformers
+# directly. It arrived transitively via sentence-transformers, so a resolver
+# change could have dropped it and broken /api/v1/generate-jd only at runtime.
+transformers~=4.44
 
 # HTTP utilities
 httpx~=0.27.0
+# api/sharepoint.py imports requests directly (Microsoft Graph calls)
+requests~=2.32

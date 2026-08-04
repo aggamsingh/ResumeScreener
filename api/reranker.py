@@ -16,6 +16,8 @@ import logging
 import os
 from typing import Any
 
+import requests
+
 from api.models import Candidate, CandidateMetadata
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ LLM_PROVIDER  = os.getenv("LLM_PROVIDER", "groq").lower()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # 1.5-flash is retired and 404s
 
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 
@@ -91,8 +93,6 @@ REQUIRED OUTPUT FORMAT:
 # ── LLM Callers ───────────────────────────────────────────────────────────────
 
 _groq_client = None
-_gemini_model = None
-_genai_module = None
 
 def _call_groq(prompt: str) -> str:
     global _groq_client
@@ -109,20 +109,43 @@ def _call_groq(prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def _call_gemini(prompt: str) -> str:
-    global _gemini_model, _genai_module
-    if _gemini_model is None:
-        import google.generativeai as genai  # type: ignore  # lazy import
-        _genai_module = genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-    response = _gemini_model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.1},
-        request_options={"timeout": LLM_TIMEOUT},
+
+def _call_gemini(prompt: str, api_key: str | None = None, temperature: float = 0.1) -> str:
+    """
+    Plain REST call, not the google-generativeai SDK.
+
+    The SDK drags in google.api_core + grpc. mock_grpc.py has to stub grpc out at
+    process start (the real cygrpc DLL is blocked in this environment), and the
+    two do not coexist: api_core kept routing responses through its gRPC error
+    path, so a simple HTTP 429 came back as "'HTTPStatus' object is not callable"
+    and reranking silently fell back to vector ordering on every request.
+    This is the same endpoint the frontend already calls directly.
+
+    api_key overrides GEMINI_API_KEY, for callers that accept a per-request key.
+    """
+    res = requests.post(
+        _GEMINI_URL.format(model=GEMINI_MODEL),
+        params={"key": api_key or GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature},
+        },
+        timeout=LLM_TIMEOUT,
     )
-    return response.text or ""
+    if not res.ok:
+        # Surface Google's own message — quota, bad key and retired model all
+        # land here and each needs a different fix by the operator.
+        raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:300]}")
+
+    candidates = res.json().get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {res.text[:300]}")
+
+    # Thinking models emit multiple parts and only some carry "text".
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p["text"] for p in parts if "text" in p)
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -298,19 +321,13 @@ def generate_llm_response(prompt: str, gemini_api_key_override: str | None = Non
         if provider == "groq":
             return _call_groq(prompt)
         elif provider == "gemini":
-            if gemini_api_key_override:
-                import google.generativeai as genai
-                # Configure with the dynamic key
-                genai.configure(api_key=gemini_api_key_override)
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                response = model.generate_content(
-                    prompt,
-                    generation_config={"temperature": 0.7},
-                    request_options={"timeout": LLM_TIMEOUT},
-                )
-                return response.text or ""
-            else:
-                return _call_gemini(prompt)
+            # One call path for both the configured key and a per-request
+            # override. The override branch used to build a google.generativeai
+            # client, which cannot work here — mock_grpc.py stubs out grpc at
+            # process start, so any SDK call fails and chat silently dropped to
+            # the template reply. Chat is conversational, so it keeps the higher
+            # temperature the SDK branch used.
+            return _call_gemini(prompt, api_key=gemini_api_key_override, temperature=0.7)
         else:
             raise ValueError(f"Unknown LLM_PROVIDER='{provider}'")
     except Exception as exc:

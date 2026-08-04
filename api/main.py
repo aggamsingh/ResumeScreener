@@ -17,6 +17,15 @@ from __future__ import annotations
 # Import mock_grpc first to bypass blocked cygrpc DLL under restrictive environment policies
 import mock_grpc
 
+# Load .env into os.environ BEFORE importing anything that reads env vars at
+# import time (api.reranker reads GROQ_API_KEY/LLM_PROVIDER, api.sharepoint reads
+# SHAREPOINT_*, indexer.parser reads ENABLE_OCR). pydantic-settings only feeds
+# .env into Settings fields — it never populates os.environ — so without this
+# every os.getenv() call below silently fell back to its default when running
+# outside Docker, e.g. reranking degraded to vector-only with no error.
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import hmac
 import logging  
@@ -48,7 +57,9 @@ from api.models import (
 )
 from api.retriever import retrieve_candidates, build_candidate_response
 from api.reranker import rerank_candidates, generate_llm_response
-from api.sharepoint import sync_sharepoint_resumes
+from api import sharepoint
+from api.sharepoint import get_graph_token, resolve_site_id, sync_sharepoint_resumes
+from indexer.utils import setup_logging
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -64,7 +75,13 @@ class Settings(BaseSettings):
     api_key: str = Field(min_length=1)
 
     # Qdrant
-    qdrant_host: str = "qdrant"
+    # "localhost", not "qdrant": docker-compose sets QDRANT_HOST=qdrant explicitly,
+    # so the service-name default only ever applied to local runs — where it never
+    # resolves. The API then fell back to embedded ./data/qdrant_db while
+    # indexer/run.py (which defaults to localhost) wrote to the Qdrant server:
+    # two different databases, so screening returned zero candidates after a
+    # seemingly successful index.
+    qdrant_host: str = "localhost"
     qdrant_port: int = 6333
     qdrant_collection: str = "resumes"
 
@@ -131,13 +148,10 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = Settings()
 
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
+    # Reuse the indexer's setup instead of a second copy of the same basicConfig:
+    # it forces UTF-8 on stdout, without which Windows consoles raise
+    # UnicodeEncodeError on any log line containing non-cp1252 characters.
+    setup_logging(settings.log_level)
 
     app = FastAPI(
         title="Resume Screener API",
@@ -154,10 +168,17 @@ def create_app() -> FastAPI:
     # Store settings on app so lifespan and routes can access them
     app.state.settings = settings
 
+    # ALLOWED_ORIGINS was parsed into Settings but never reached the middleware:
+    # every deployment ran with allow_origin_regex=r"https?://.*", i.e. any site
+    # on the internet could call this API from a user's browser regardless of
+    # what the operator configured. Honour the setting; "*" still opts out.
+    origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"https?://.*",
-        allow_credentials=True,
+        allow_origins=["*"] if "*" in origins else origins,
+        # Credentials cannot be combined with a "*" origin (browsers reject it),
+        # and auth here is a header, not a cookie — so it is never needed.
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -503,9 +524,14 @@ def run_sharepoint_sync_task(
         from indexer.embedder import embed_and_upsert, ensure_collection
 
         cv_dir = Path(cv_folder_path)
+        # rglob, not glob: CVs dropped into subfolders of cvs/ (the usual shape
+        # once SharePoint folders are mirrored) were previously never indexed.
+        # Extensions come from the parser so we never queue a file it will drop.
+        from indexer.parser import SUPPORTED_EXTENSIONS
+
         existing_files = [
-            f for f in cv_dir.glob("*")
-            if f.suffix.lower() in (".pdf", ".docx", ".doc", ".txt") and not f.name.startswith(".")
+            f for f in cv_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS and not f.name.startswith(".")
         ]
 
         if existing_files:
@@ -541,6 +567,8 @@ def run_sharepoint_sync_task(
             tenant_id=body.tenant_id,
             client_id=body.client_id,
             client_secret=body.client_secret,
+            site_url=body.site_url,
+            folder_path=body.folder_path,
             target_dir=cv_folder_path,
             on_file_downloaded=on_download,
         )
@@ -562,10 +590,54 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
     parses them, and indexes them into Qdrant using the local embedding model in the background.
     """
     settings: Settings = request.app.state.settings
+    cv_folder_path = getattr(settings, "cv_folder_path", "./cvs")
+
+    # Validate credentials, site and write access up front. The download loop
+    # still runs in the background, but a bad tenant/secret/site_url now fails
+    # the request instead of returning "success" while the real error is buried
+    # in the server log where the caller never sees it.
+    try:
+        creds = (
+            body.tenant_id or sharepoint.DEFAULT_TENANT_ID,
+            body.client_id or sharepoint.DEFAULT_CLIENT_ID,
+            body.client_secret or sharepoint.DEFAULT_CLIENT_SECRET,
+        )
+        if not all(creds):
+            raise ValueError(
+                "SharePoint Azure AD credentials are required. Send tenant_id, client_id and "
+                "client_secret in the request body, or set SHAREPOINT_TENANT_ID / "
+                "SHAREPOINT_CLIENT_ID / SHAREPOINT_CLIENT_SECRET in .env."
+            )
+        token = get_graph_token(*creds)
+        resolve_site_id(
+            {"Authorization": f"Bearer {token}"},
+            body.site_url or sharepoint.DEFAULT_SITE_URL or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("SharePoint preflight failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Could not reach Microsoft Graph: {exc}")
+
+    cv_dir = Path(cv_folder_path)
+    try:
+        cv_dir.mkdir(parents=True, exist_ok=True)
+        probe = cv_dir / ".write_probe"
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"CV folder '{cv_dir}' is not writable ({exc}). Downloaded resumes would be "
+                "discarded. Check CV_FOLDER_PATH and that the folder is mounted read-write."
+            ),
+        )
+
     background_tasks.add_task(
         run_sharepoint_sync_task,
         body=body,
-        cv_folder_path=getattr(settings, "cv_folder_path", "./cvs"),
+        cv_folder_path=cv_folder_path,
         qdrant_client=request.app.state.qdrant,
         sentence_transformer_model=request.app.state.model,
         collection_name=settings.qdrant_collection,

@@ -119,7 +119,25 @@ def main() -> None:
             QDRANT_PORT,
             e,
         )
-        qdrant = QdrantClient(path="./data/qdrant_db")
+        logger.warning(
+            "Embedded mode writes to a DIFFERENT database than the Qdrant server. "
+            "If the API is running against the server, CVs indexed now will not "
+            "appear in search results. Start Qdrant first to avoid this."
+        )
+        try:
+            qdrant = QdrantClient(path="./data/qdrant_db")
+        except Exception as local_err:
+            # Embedded Qdrant takes an exclusive lock on the storage folder, so
+            # a running API in embedded mode blocks the indexer entirely.
+            logger.error(
+                "Could not open the embedded database at ./data/qdrant_db: %s\n"
+                "  → Another process (usually the running API) holds it open. "
+                "Embedded Qdrant allows only one process at a time.\n"
+                "  → Stop the API and re-run, or start the Qdrant server "
+                "(docker compose up -d qdrant) so both can share it.",
+                local_err,
+            )
+            sys.exit(1)
         logger.info("Embedded local Qdrant database initialized")
 
     # ── Load embedding model ───────────────────────────────────────

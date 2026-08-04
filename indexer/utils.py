@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(level: str = "INFO") -> None:
     """Configure structured stdout logging for the indexer."""
+    # Windows consoles default to cp1252, which cannot encode the '→' and '✓'
+    # used in the progress messages below. Every such line raised
+    # UnicodeEncodeError inside the logging handler — including the "no CVs
+    # found" hint, so the one message explaining an empty run was the one that
+    # blew up. Harmless no-op where stdout is already UTF-8 (Docker, Linux).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

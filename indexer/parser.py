@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -96,9 +97,18 @@ def _extract_name(text: str, filename_stem: str) -> str:
                     if not any(ch in line for ch in (":", "|", "/", "@", "–", "!", "?")):
                         return line
 
-    # Fallback: derive from filename
-    stem = filename_stem.replace("_", " ").replace("-", " ")
-    return " ".join(w.capitalize() for w in stem.split())
+    # Fallback: derive from filename.
+    # SharePoint-synced CVs are named "<34-char item id>_Naukri_JaneDoe[3y_2m].docx",
+    # so the raw stem produced candidate names like
+    # "01pqatdqlope53i7b2grd3avr4wjftrubj Naukri Janedoe[3y 2m]".
+    # Drop the id prefix, the job-board tag and the trailing [Xy_Zm] experience
+    # marker before title-casing. api/main.py already strips the same id prefix
+    # when serving the file — this brings the displayed name in line with it.
+    stem = re.sub(r"^[A-Za-z0-9]{34}_", "", filename_stem)
+    stem = re.sub(r"\[[^\]]*\]\s*$", "", stem)
+    stem = re.sub(r"^(naukri|resume|cv)[_\-\s]+", "", stem, flags=re.IGNORECASE)
+    stem = stem.replace("_", " ").replace("-", " ").strip()
+    return " ".join(w.capitalize() for w in stem.split()) or filename_stem
 
 
 # ── Text Chunking ──────────────────────────────────────────────────────────────
