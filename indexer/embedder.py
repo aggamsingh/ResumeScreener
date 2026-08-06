@@ -171,6 +171,49 @@ def embed_and_upsert(
         client.upsert(collection_name=collection_name, points=batch, wait=True)
         total_upserted += len(batch)
 
+    # ── Upsert parsed CV to local PostgreSQL resumes table ─────
+    try:
+        import psycopg2
+        db_url = "postgresql://postgres:root@localhost/resume_lens"
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        skills_list = meta.skills if isinstance(meta.skills, list) else []
+        
+        cur.execute(
+            """
+            INSERT INTO resumes (
+                id, full_name, email, skills, years_experience, location, resume_text, source_file_url, status, source_type, last_synced_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                full_name = EXCLUDED.full_name,
+                email = EXCLUDED.email,
+                skills = EXCLUDED.skills,
+                years_experience = EXCLUDED.years_experience,
+                location = EXCLUDED.location,
+                resume_text = EXCLUDED.resume_text,
+                source_file_url = EXCLUDED.source_file_url,
+                last_synced_at = NOW()
+            """,
+            (
+                parsed_cv.candidate_id,
+                parsed_cv.name,
+                meta.email,
+                skills_list,
+                meta.experience_years or 0,
+                meta.location,
+                parsed_cv.raw_text,
+                parsed_cv.cv_path,
+                "new",
+                "sharepoint"
+            )
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Successfully upserted candidate '%s' to PostgreSQL", parsed_cv.name)
+    except Exception as pg_exc:
+        logger.warning("Failed to upsert candidate '%s' to PostgreSQL: %s", parsed_cv.name, pg_exc)
+
     logger.debug(
         "Upserted %d chunks for '%s' (candidate_id=%s)",
         total_upserted,
