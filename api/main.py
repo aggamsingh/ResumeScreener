@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 import re
+import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
     
@@ -42,6 +43,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import PointStruct, Filter, FilterSelector, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
 
 from api.models import (
@@ -167,6 +169,7 @@ def create_app() -> FastAPI:
 
     # Store settings on app so lifespan and routes can access them
     app.state.settings = settings
+    app.state.canonical_index_status = {"running": False, "processed": 0, "total": 0, "failed": 0, "finished_at": None, "error": None}
 
     # ALLOWED_ORIGINS was parsed into Settings but never reached the middleware:
     # every deployment ran with allow_origin_regex=r"https?://.*", i.e. any site
@@ -186,6 +189,87 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+def _resume_chunks(text: str, words_per_chunk: int = 220, overlap: int = 40) -> list[str]:
+    """Small, deterministic chunks suitable for semantic resume retrieval."""
+    words = re.sub(r"\s+", " ", text or "").strip().split(" ")
+    if not words:
+        return []
+    step = max(1, words_per_chunk - overlap)
+    return [" ".join(words[start : start + words_per_chunk]) for start in range(0, len(words), step)]
+
+
+def rebuild_canonical_sharepoint_index(app: FastAPI) -> None:
+    """Rebuild Qdrant solely from canonical PostgreSQL SharePoint resume rows."""
+    status = app.state.canonical_index_status
+    status.update({"running": True, "processed": 0, "total": 0, "failed": 0, "finished_at": None, "error": None})
+    conn = None
+    try:
+        import psycopg2
+        from indexer.embedder import ensure_collection
+
+        db_url = os.getenv("DATABASE_URL", "postgresql://postgres:root@localhost/resume_lens")
+        conn = psycopg2.connect(db_url)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, full_name, email, skills, years_experience, location, resume_text, source_file_url FROM resumes WHERE source_file_url LIKE 'sharepoint://%'")
+        status["total"] = cursor.rowcount
+
+        client = app.state.qdrant
+        collection = app.state.settings.qdrant_collection
+        try:
+            client.delete_collection(collection)
+        except Exception:
+            pass
+        ensure_collection(client, collection, app.state.model.get_sentence_embedding_dimension())
+
+        while True:
+            rows = cursor.fetchmany(25)
+            if not rows:
+                break
+            for candidate_id, name, email, skills, years, location, resume_text, source_url in rows:
+                try:
+                    chunks = _resume_chunks(resume_text)
+                    if not chunks:
+                        status["failed"] += 1
+                        continue
+                    vectors = app.state.model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
+                    payload = {
+                        "candidate_id": str(candidate_id), "name": name or "Unnamed candidate", "cv_path": source_url,
+                        "experience_years": years, "location": location, "location_raw": location,
+                        "skills": skills or [], "email": email, "ocr_used": False,
+                    }
+                    points = [PointStruct(id=str(uuid.uuid4()), vector=vector, payload={**payload, "chunk_text": chunk}) for chunk, vector in zip(chunks, vectors)]
+                    client.upsert(collection_name=collection, points=points, wait=True)
+                    status["processed"] += 1
+                except Exception as exc:
+                    logger.warning("Canonical index failed for %s: %s", candidate_id, exc)
+                    status["failed"] += 1
+        cursor.close()
+        logger.info("Canonical Qdrant rebuild completed: %d/%d", status["processed"], status["total"])
+    except Exception as exc:
+        logger.exception("Canonical Qdrant rebuild failed")
+        status["error"] = str(exc)
+    finally:
+        if conn:
+            conn.close()
+        status["running"] = False
+        from datetime import datetime, timezone
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/api/v1/index-status", tags=["Indexing"], summary="Canonical vector-index progress")
+async def canonical_index_status(request: Request):
+    return request.app.state.canonical_index_status
+
+
+@app.post("/api/v1/reindex-canonical", tags=["Indexing"], summary="Rebuild vector index from canonical SharePoint resumes")
+async def reindex_canonical(request: Request, background_tasks: BackgroundTasks):
+    status = request.app.state.canonical_index_status
+    if status["running"]:
+        raise HTTPException(status_code=409, detail="Canonical vector indexing is already running.")
+    background_tasks.add_task(rebuild_canonical_sharepoint_index, request.app)
+    return {"started": True, "message": "Canonical SharePoint vector indexing started."}
 
 # ── Auth Middleware ────────────────────────────────────────────────────────────
 

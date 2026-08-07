@@ -172,7 +172,9 @@ def embed_and_upsert(
         total_upserted += len(batch)
 
     # ── Upsert parsed CV to local PostgreSQL resumes table ─────
+    # PostgreSQL is the canonical source of truth; do not create local-path duplicates.
     try:
+        raise RuntimeError("PostgreSQL candidate writes are intentionally disabled for the vector worker")
         import psycopg2
         db_url = "postgresql://postgres:root@localhost/resume_lens"
         conn = psycopg2.connect(db_url)
