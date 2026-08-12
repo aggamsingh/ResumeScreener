@@ -27,6 +27,29 @@ A production-ready, self-hosted REST microservice that accepts a **Job Descripti
 
 ---
 
+## 🟢 Quick Local Startup & Shutdown Guide
+
+### 1️⃣ Run Python API Microservice (Port 8000)
+```bash
+cd C:\Users\Hp\ResumeScreener
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+> **API Server live at:** `http://localhost:8000` (Interactive Swagger Docs at `http://localhost:8000/docs`)
+
+### 2️⃣ Run Express Backend & React Frontend (Port 5000)
+```bash
+cd C:\Users\Hp\resume-lens
+npm run dev
+```
+> **Web UI live at:** `http://localhost:5000`
+
+### 🛑 How to Stop / Will it affect code?
+- Press `CTRL + C` in terminal (or click Stop in IDE task manager).
+- **Does stopping affect code or data?** **NO.** Stopping the server will **NEVER** affect or delete your code, database tables, or vector index. All data remains 100% safe on disk.
+- To start it again, simply re-run the `python -m uvicorn ...` or `npm run dev` command whenever needed.
+
+---
+
 ## 1. System Architecture
 
 ```
