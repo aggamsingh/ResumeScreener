@@ -209,11 +209,12 @@ def rebuild_canonical_sharepoint_index(app: FastAPI) -> None:
         import psycopg2
         from indexer.embedder import ensure_collection
 
-        db_url = os.getenv("DATABASE_URL", "postgresql://postgres:root@localhost/resume_lens")
+        db_url = os.getenv("DATABASE_URL", "postgresql://postgres:root@127.0.0.1:5432/resume_lens")
         conn = psycopg2.connect(db_url)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, full_name, email, skills, years_experience, location, resume_text, source_file_url FROM resumes WHERE source_file_url LIKE 'sharepoint://%'")
-        status["total"] = cursor.rowcount
+        cursor.execute("SELECT id, full_name, email, skills, years_experience, location, resume_text, source_file_url FROM resumes WHERE resume_text IS NOT NULL AND length(trim(resume_text)) > 0")
+        rows = cursor.fetchall()
+        status["total"] = len(rows)
 
         client = app.state.qdrant
         collection = app.state.settings.qdrant_collection
@@ -223,28 +224,40 @@ def rebuild_canonical_sharepoint_index(app: FastAPI) -> None:
             pass
         ensure_collection(client, collection, app.state.model.get_sentence_embedding_dimension())
 
-        while True:
-            rows = cursor.fetchmany(25)
-            if not rows:
-                break
-            for candidate_id, name, email, skills, years, location, resume_text, source_url in rows:
-                try:
-                    chunks = _resume_chunks(resume_text)
-                    if not chunks:
-                        status["failed"] += 1
-                        continue
-                    vectors = app.state.model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
-                    payload = {
-                        "candidate_id": str(candidate_id), "name": name or "Unnamed candidate", "cv_path": source_url,
-                        "experience_years": years, "location": location, "location_raw": location,
-                        "skills": skills or [], "email": email, "ocr_used": False,
-                    }
-                    points = [PointStruct(id=str(uuid.uuid4()), vector=vector, payload={**payload, "chunk_text": chunk}) for chunk, vector in zip(chunks, vectors)]
-                    client.upsert(collection_name=collection, points=points, wait=True)
-                    status["processed"] += 1
-                except Exception as exc:
-                    logger.warning("Canonical index failed for %s: %s", candidate_id, exc)
+        try:
+            import torch
+            torch.set_num_threads(2)
+        except Exception:
+            pass
+
+        batch_points = []
+        import time
+        for candidate_id, name, email, skills, years, location, resume_text, source_url in rows:
+            try:
+                chunks = _resume_chunks(resume_text)
+                if not chunks:
                     status["failed"] += 1
+                    continue
+                vectors = app.state.model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
+                payload = {
+                    "candidate_id": str(candidate_id), "name": name or "Unnamed candidate", "cv_path": source_url,
+                    "experience_years": years, "location": location, "location_raw": location,
+                    "skills": skills or [], "email": email, "ocr_used": False,
+                }
+                points = [PointStruct(id=str(uuid.uuid4()), vector=vector, payload={**payload, "chunk_text": chunk}) for chunk, vector in zip(chunks, vectors)]
+                batch_points.extend(points)
+                status["processed"] += 1
+
+                if len(batch_points) >= 300:
+                    client.upsert(collection_name=collection, points=batch_points, wait=False)
+                    batch_points = []
+                time.sleep(0.002)
+            except Exception as exc:
+                logger.warning("Canonical index failed for %s: %s", candidate_id, exc)
+                status["failed"] += 1
+
+        if batch_points:
+            client.upsert(collection_name=collection, points=batch_points, wait=True)
         cursor.close()
         logger.info("Canonical Qdrant rebuild completed: %d/%d", status["processed"], status["total"])
     except Exception as exc:
@@ -264,12 +277,13 @@ async def canonical_index_status(request: Request):
 
 
 @app.post("/api/v1/reindex-canonical", tags=["Indexing"], summary="Rebuild vector index from canonical SharePoint resumes")
-async def reindex_canonical(request: Request, background_tasks: BackgroundTasks):
+async def reindex_canonical(request: Request):
+    import subprocess
+    import sys
     status = request.app.state.canonical_index_status
-    if status["running"]:
-        raise HTTPException(status_code=409, detail="Canonical vector indexing is already running.")
-    background_tasks.add_task(rebuild_canonical_sharepoint_index, request.app)
-    return {"started": True, "message": "Canonical SharePoint vector indexing started."}
+    subprocess.Popen([sys.executable, "indexer/rebuild_canonical.py"], cwd="c:/Users/Hp/ResumeScreener")
+    status["running"] = True
+    return {"started": True, "message": "Canonical SharePoint vector indexing started in background process."}
 
 # ── Auth Middleware ────────────────────────────────────────────────────────────
 
@@ -517,7 +531,7 @@ async def chat_agent(request: Request, body: ChatRequest):
             f"Experience: {exp}\n"
             f"Location: {loc}\n"
             f"Skills: {skills}\n"
-            f"Resume Excerpt:\n{cv_excerpt[:800]}\n"
+            f"Resume Excerpt:\n{cv_excerpt[:3000]}\n"
             f"-----------------\n"
         )
 
@@ -718,7 +732,9 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
             ),
         )
 
+    import asyncio
     background_tasks.add_task(
+        asyncio.to_thread,
         run_sharepoint_sync_task,
         body=body,
         cv_folder_path=cv_folder_path,

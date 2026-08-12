@@ -28,7 +28,7 @@ LLM_PROVIDER  = os.getenv("LLM_PROVIDER", "groq").lower()
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # 1.5-flash is retired and 404s
+GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 
@@ -55,7 +55,7 @@ def _build_prompt(jd_text: str, candidates: list[dict[str, Any]], top_k: int) ->
             lines.append(f"Location: {meta['location']}")
         if meta.get("skills"):
             lines.append(f"Key Skills: {', '.join(meta['skills'][:15])}")
-        lines.append(f"CV Excerpt:\n{c['best_chunk_text'][:800]}")
+        lines.append(f"CV Excerpt:\n{c['best_chunk_text'][:3000]}")
         return "\n".join(lines)
 
     candidate_sections = "\n\n".join(
@@ -65,7 +65,7 @@ def _build_prompt(jd_text: str, candidates: list[dict[str, Any]], top_k: int) ->
     return f"""You are an expert recruitment assistant helping an HR team shortlist candidates.
 
 JOB DESCRIPTION:
-{jd_text[:2500]}
+{jd_text[:10000]}
 
 CANDIDATES TO EVALUATE:
 {candidate_sections}

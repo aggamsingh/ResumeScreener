@@ -256,12 +256,23 @@ def retrieve_candidates(
         actual_top_n,
     )
     try:
-        hits = qdrant_client.search(
-            collection_name=collection_name,
-            query_vector=jd_vector,
-            limit=actual_top_n,
-            with_payload=True,
-        )
+        if hasattr(qdrant_client, "query_points"):
+            res = qdrant_client.query_points(
+                collection_name=collection_name,
+                query=jd_vector,
+                limit=actual_top_n,
+                with_payload=True,
+            )
+            hits = getattr(res, "points", res)
+        elif hasattr(qdrant_client, "search"):
+            hits = qdrant_client.search(
+                collection_name=collection_name,
+                query_vector=jd_vector,
+                limit=actual_top_n,
+                with_payload=True,
+            )
+        else:
+            hits = []
     except Exception as e:
         logger.warning("Qdrant search error or collection empty: %s", e)
         return [], 0
