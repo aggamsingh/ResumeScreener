@@ -1,0 +1,46 @@
+{
+  "passed": [
+    {
+      "feature": "Express Candidate List API",
+      "url": "http://localhost:5000/api/candidates",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "Express Search Filter API",
+      "url": "http://localhost:5000/api/candidates?searchTerm=Accountant&minExperience=2",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "AI Chat Step 1 (Initial Search Request)",
+      "url": "http://localhost:8000/api/v1/chat",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "AI Chat Step 2 (Refinement Selection)",
+      "url": "http://localhost:8000/api/v1/chat",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "AI Chat Step 3 (Count Selection - Top 10)",
+      "url": "http://localhost:8000/api/v1/chat",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "AI Screening Generator (5 Questions)",
+      "url": "http://localhost:8000/api/v1/simulate-screening",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "AI Screening Evaluation & Scorecard",
+      "url": "http://localhost:8000/api/v1/simulate-screening",
+      "summary": "Status 200 OK"
+    },
+    {
+      "feature": "Smart JD Matcher Leaderboard (Top 10)",
+      "url": "http://localhost:8000/api/v1/jd-match",
+      "summary": "Status 200 OK"
+    }
+  ],
+  "failed": [],
+  "warnings": []
+}

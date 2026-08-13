@@ -46,9 +46,12 @@ def main():
 
     for candidate_id, name, email, skills, years, location, resume_text, source_url in rows:
         try:
-            chunks = resume_chunks(resume_text)
-            if not chunks:
+            raw_chunks = resume_chunks(resume_text)
+            if not raw_chunks:
                 continue
+            skills_str = ", ".join(skills) if (skills and isinstance(skills, list)) else "N/A"
+            summary_chunk = f"QUALIFICATION SUMMARY | Candidate: {name or 'Candidate'} | Experience: {years or 0} years | Location: {location or 'N/A'} | Core Skills & Tech Stack: {skills_str} | Resume: {(resume_text or '')[:1200]}"
+            chunks = [summary_chunk] + raw_chunks
             vectors = model.encode(chunks, batch_size=128, show_progress_bar=False).tolist()
             payload = {
                 "candidate_id": str(candidate_id), "name": name or "Unnamed candidate", "cv_path": source_url,

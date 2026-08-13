@@ -12,6 +12,15 @@ from pydantic import BaseModel, Field, model_validator
 
 # ── Request Models ─────────────────────────────────────────────────────────────
 
+class CandidateIndexRequest(BaseModel):
+    id: str
+    name: str
+    resume_text: str
+    skills: Optional[list[str]] = None
+    years_experience: Optional[int] = 0
+    location: Optional[str] = None
+    cv_path: Optional[str] = None
+
 class ScreeningFilters(BaseModel):
     """
     Hard filters applied before LLM reranking.
@@ -225,6 +234,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str = Field(description="AI response text in markdown")
+    candidates: Optional[list[dict]] = Field(default=[], description="Candidate profile objects matching the request")
 
 
 class SyncRequest(BaseModel):
@@ -243,9 +253,74 @@ class SyncResponse(BaseModel):
 
 
 class JDRequest(BaseModel):
-    job_title: str = Field(description="The job title to generate description and keywords for")
+    job_title: str = Field(description="The job title to generate description for")
+    keywords: Optional[list[str]] = Field(default_factory=list, description="User selected keywords/skills to incorporate into the JD")
+    min_experience: Optional[int] = Field(None, description="Minimum years of experience")
+    max_experience: Optional[int] = Field(None, description="Maximum years of experience")
+    salary_lpa: Optional[str] = Field(None, description="Offering salary in LPA")
+    location: Optional[str] = Field(None, description="Preferred location")
+    education_level: Optional[str] = Field(None, description="Minimum education level")
+    freshers_only: Optional[bool] = Field(False, description="Freshers only flag")
 
 
 class JDResponse(BaseModel):
     job_description: str = Field(description="Synthesized job description")
     keywords: list[str] = Field(default_factory=list, description="Extracted keywords/skills")
+
+
+class InterviewQuestion(BaseModel):
+    id: int = Field(description="Question ID")
+    question: str = Field(description="Technical or behavioral screening question")
+    expectedAnswer: str = Field(description="Key concepts expected in a strong answer")
+
+
+class InterviewGrade(BaseModel):
+    questionId: int = Field(description="Question ID")
+    score: int = Field(description="Score out of 100")
+    feedback: str = Field(description="Detailed evaluation feedback")
+
+
+class AssessmentReport(BaseModel):
+    score: int = Field(description="Overall technical score out of 100")
+    overallFeedback: str = Field(description="Summary verdict and hiring recommendation")
+    grades: list[InterviewGrade] = Field(default_factory=list, description="Question grades")
+
+
+class ScreeningSimulationRequest(BaseModel):
+    candidate_id: str = Field(description="Candidate ID")
+    job_role: str = Field(description="Target job title / role")
+    candidate_name: Optional[str] = Field(None, description="Candidate full name")
+    candidate_cv_text: Optional[str] = Field(None, description="Candidate CV text snippet")
+    answers: Optional[dict[str, str]] = Field(default=None, description="Candidate answers map keyed by question ID")
+
+
+class ScreeningSimulationResponse(BaseModel):
+    questions: list[InterviewQuestion] = Field(default_factory=list, description="Generated technical screening questions")
+    report: Optional[AssessmentReport] = Field(default=None, description="Grading report if answers were evaluated")
+
+
+class JDMatchCandidate(BaseModel):
+    candidate_id: str = Field(description="Candidate ID")
+    name: str = Field(description="Candidate full name")
+    score: float = Field(description="Match score 0.0 to 1.0")
+    match_percentage: int = Field(description="Match percentage 0 to 100%")
+    strengths: list[str] = Field(default_factory=list, description="Key candidate strengths for this position")
+    gaps: list[str] = Field(default_factory=list, description="Identified skill or experience gaps")
+    verdict: str = Field(description="Recruiter verdict and recommendation")
+    cv_path: Optional[str] = Field(None, description="Path to candidate resume file")
+
+
+class JDMatchRequest(BaseModel):
+    job_description: str = Field(description="Job description or requirements text")
+    top_k: Optional[int] = Field(10, description="Top N candidates to evaluate")
+
+
+class CandidateFeedbackRequest(BaseModel):
+    candidate_id: str = Field(description="Candidate ID")
+    query_text: Optional[str] = Field("", description="Query or job role for which feedback was given")
+    feedback_type: str = Field("shortlisted", description="Feedback type: shortlisted, hired, rejected, viewed")
+    score_boost: Optional[float] = Field(0.1, description="Score adjustment multiplier")
+
+
+class JDMatchResponse(BaseModel):
+    candidates: list[JDMatchCandidate] = Field(default_factory=list, description="Matched candidate leaderboard")

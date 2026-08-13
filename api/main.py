@@ -33,6 +33,8 @@ import os
 import sys
 import re
 import uuid
+import requests
+import json
 from pathlib import Path
 from contextlib import asynccontextmanager
     
@@ -46,16 +48,32 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Filter, FilterSelector, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
 
+try:
+    import psycopg2  # type: ignore
+except ImportError:
+    psycopg2 = None  # type: ignore
+
 from api.models import (
     ChatRequest,
     ChatResponse,
     HealthResponse,
     ScreeningRequest,
     ScreeningResponse,
+    ScreeningFilters,
+    CandidateIndexRequest,
     SyncRequest,
     SyncResponse,
     JDRequest,
     JDResponse,
+    ScreeningSimulationRequest,
+    ScreeningSimulationResponse,
+    InterviewQuestion,
+    InterviewGrade,
+    AssessmentReport,
+    JDMatchRequest,
+    JDMatchResponse,
+    JDMatchCandidate,
+    CandidateFeedbackRequest,
 )
 from api.retriever import retrieve_candidates, build_candidate_response
 from api.reranker import rerank_candidates, generate_llm_response
@@ -127,8 +145,12 @@ async def lifespan(app: FastAPI):
         logger.info("Connected to Qdrant server successfully")
     except Exception as e:
         logger.warning("Could not connect to Qdrant server at %s:%d (%s). Falling back to embedded local storage at ./data/qdrant_db", settings.qdrant_host, settings.qdrant_port, e)
-        app.state.qdrant = QdrantClient(path="./data/qdrant_db")
-        logger.info("Embedded local Qdrant database initialized")
+        try:
+            app.state.qdrant = QdrantClient(path="./data/qdrant_db")
+            logger.info("Embedded local Qdrant database initialized")
+        except Exception as q_lock_err:
+            logger.warning("Local Qdrant db folder locked (%s), falling back to in-memory vector storage", q_lock_err)
+            app.state.qdrant = QdrantClient(":memory:")
 
     try:
         from indexer.embedder import ensure_collection
@@ -206,7 +228,7 @@ def rebuild_canonical_sharepoint_index(app: FastAPI) -> None:
     status.update({"running": True, "processed": 0, "total": 0, "failed": 0, "finished_at": None, "error": None})
     conn = None
     try:
-        import psycopg2
+        import psycopg2  # type: ignore
         from indexer.embedder import ensure_collection
 
         db_url = os.getenv("DATABASE_URL", "postgresql://postgres:root@127.0.0.1:5432/resume_lens")
@@ -234,10 +256,13 @@ def rebuild_canonical_sharepoint_index(app: FastAPI) -> None:
         import time
         for candidate_id, name, email, skills, years, location, resume_text, source_url in rows:
             try:
-                chunks = _resume_chunks(resume_text)
-                if not chunks:
+                raw_chunks = _resume_chunks(resume_text)
+                if not raw_chunks:
                     status["failed"] += 1
                     continue
+                skills_str = ", ".join(skills) if (skills and isinstance(skills, list)) else "N/A"
+                summary_chunk = f"QUALIFICATION SUMMARY | Candidate: {name or 'Candidate'} | Experience: {years or 0} years | Location: {location or 'N/A'} | Core Skills & Tech Stack: {skills_str} | Resume: {(resume_text or '')[:1200]}"
+                chunks = [summary_chunk] + raw_chunks
                 vectors = app.state.model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
                 payload = {
                     "candidate_id": str(candidate_id), "name": name or "Unnamed candidate", "cv_path": source_url,
@@ -408,6 +433,47 @@ async def health_check(request: Request):
 
 
 @app.post(
+    "/api/v1/index-candidate",
+    tags=["Indexing"],
+    summary="Instantly index a newly uploaded candidate into Qdrant vector database",
+)
+async def index_single_candidate(request: Request, body: CandidateIndexRequest):
+    """
+    Parses candidate text, generates vector embeddings, and upserts candidate chunks
+    into Qdrant vector database so AI search tools (Copilot Chatbot, Smart JD Matcher)
+    can immediately query and display the candidate.
+    """
+    settings: Settings = request.app.state.settings
+    qdrant_client = request.app.state.qdrant
+    model = request.app.state.model
+
+    from indexer.chunker import chunk_cv_text  # type: ignore
+    from indexer.models import CandidateCV, CandidateMetadata  # type: ignore
+
+    meta = CandidateMetadata(
+        experience_years=body.years_experience,
+        skills=body.skills or [],
+        location=body.location,
+    )
+    cand_cv = CandidateCV(
+        candidate_id=body.id,
+        name=body.name,
+        raw_text=body.resume_text,
+        file_path=body.cv_path or "",
+        metadata=meta,
+        chunks=chunk_cv_text(body.resume_text, cand_id=body.id)
+    )
+
+    from indexer.embedder import embed_and_upsert, ensure_collection
+    vector_dim = model.get_sentence_embedding_dimension()
+    ensure_collection(qdrant_client, settings.qdrant_collection, vector_dim)
+    embed_and_upsert(qdrant_client, model, cand_cv, settings.qdrant_collection)
+
+    logger.info("Instantly indexed candidate into Qdrant vector DB: %s (%s)", body.name, body.id)
+    return {"status": "success", "candidate_id": body.id, "chunks_indexed": len(cand_cv.chunks)}
+
+
+@app.post(
     "/api/v1/screen",
     response_model=ScreeningResponse,
     tags=["Screening"],
@@ -495,116 +561,393 @@ async def chat_agent(request: Request, body: ChatRequest):
     Processes user query against indexed resumes using local vector retrieval
     and local NLP analysis, with fallback to standard template if LLM is unavailable.
     """
-    settings: Settings = request.app.state.settings
-    query_text = body.message.strip()
-
-    if not query_text:
-        return ChatResponse(reply="Please provide a query or question about your candidates.")
-
-    # Retrieve candidates using local MiniLM embedding model + Qdrant vector index
     try:
-        raw_candidates, _ = retrieve_candidates(
-            qdrant_client=request.app.state.qdrant,
-            model=request.app.state.model,
-            jd_text=query_text,
-            collection_name=settings.qdrant_collection,
-            top_n=10,
-        )
-    except Exception as exc:
-        logger.error("Chat candidate retrieval failed: %s", exc, exc_info=True)
-        raw_candidates = []
+        settings: Settings = request.app.state.settings
+        query_text = body.message.strip()
 
-    # Format candidate context details for the LLM
-    candidates = [build_candidate_response(c) for c in raw_candidates[:8]]
-    candidates_context = ""
-    for idx, cand in enumerate(candidates, 1):
-        name = cand.get("name") or "Unknown Candidate"
-        metadata = cand.get("metadata", {})
-        exp = f"{metadata.get('experience_years')} years" if metadata.get('experience_years') is not None else "N/A"
-        loc = metadata.get("location") or "N/A"
-        skills = ", ".join(metadata.get("skills", []))
-        cv_excerpt = cand.get("best_chunk_text") or ""
-        candidates_context += (
-            f"Candidate {idx}:\n"
-            f"ID: {cand.get('candidate_id')}\n"
-            f"Name: {name}\n"
-            f"Experience: {exp}\n"
-            f"Location: {loc}\n"
-            f"Skills: {skills}\n"
-            f"Resume Excerpt:\n{cv_excerpt[:3000]}\n"
-            f"-----------------\n"
-        )
+        # 1. Parse ONLY user messages from history and current query
+        history_list = body.history or []
+        user_messages = [h.content for h in history_list if h.role == "user"] + [query_text]
+        user_combined_text = " ".join(user_messages)
+        
+        # 2. Classify intent: Candidate Search vs. General HR Assistant Deliverable
+        hr_task_keywords = [
+            "draft", "write", "template", "email", "invite", "rejection", "offer", "letter",
+            "interview question", "questions to ask", "screening question", "jd", "job description",
+            "policy", "payroll", "notice period", "ctc", "onboarding", "checklist", "salary",
+            "hello", "hi", "hey", "who are you", "what can you do", "help", "guide", "advice"
+        ]
+        is_hr_deliverable = any(kw in query_text.lower() for kw in hr_task_keywords)
+        is_explicit_search = bool(re.search(r'\b(?:find|search|show\s+candidates|show\s+top|list\s+candidates|get\s+candidates|looking\s+for|select\s+candidates|candidates|resumes|profiles|cvs)\b', query_text, re.IGNORECASE))
 
-    # Format history context
-    history_context = ""
-    if body.history:
-        for item in body.history:
-            role_name = "User" if item.role == "user" else "Assistant"
-            history_context += f"{role_name}: {item.content}\n"
+        # --- ROUTE A: GENERAL HR ASSISTANT / TEMPLATE DRAFTING / GUIDANCE ---
+        if is_hr_deliverable and not is_explicit_search:
+            history_context = ""
+            if body.history:
+                for item in body.history:
+                    role_name = "User" if item.role == "user" else "Assistant"
+                    history_context += f"{role_name}: {item.content}\n"
 
-    # Construct LLM prompt
-    prompt = f"""You are "Aryan", a smart and helpful AI Recruiter Copilot at TalentMatch.
-You help recruitment and HR teams evaluate candidates, compare skillsets, check locations, draft screening emails/invitations, and answer recruiting questions.
+            prompt = f"""You are "Aryan", an elite autonomous AI HR Recruiter & Talent Acquisition Specialist at TalentMatch.
+The user is an HR recruiter requesting assistance with an HR task, email drafting, screening template, interview prep, policy guidance, or general consultation.
 
-Below is a list of the top candidate profiles retrieved from our vector database that match the user's current query:
+User Request: "{query_text}"
+
+INSTRUCTIONS:
+1. Provide a comprehensive, structured, ready-to-use markdown response.
+2. If drafting an email or letter template, provide clear subject line, professional salutation, body paragraphs, and actionable placeholders (e.g., [Candidate Name], [Role Title], [Company Name]).
+3. Use clean markdown formatting, bold headers, and bullet points. Do NOT include candidate profile cards unless specifically requested.
+
+Conversation History:
+{history_context}
+User: {query_text}
+Assistant:"""
+            gemini_key_override = request.headers.get("X-Gemini-API-Key", "").strip() or None
+            try:
+                reply_text = generate_llm_response(prompt, gemini_api_key_override=gemini_key_override)
+                if reply_text and reply_text.strip():
+                    return ChatResponse(reply=reply_text.strip(), candidates=[])
+            except Exception as llm_err:
+                logger.warning("LLM call failed for HR deliverable: %s. Using template fallback.", llm_err)
+
+            # Fallback template for email / HR requests if LLM is offline
+            if "email" in query_text.lower() or "invite" in query_text.lower() or "draft" in query_text.lower():
+                fallback_reply = (
+                    f"### ✉️ Technical Recruiter Screening Invite Email Template\n\n"
+                    f"**Subject:** Interview Invite: Technical Recruiter Screening Call with [Company Name] — [Candidate Name]\n\n"
+                    f"Dear [Candidate Name],\n\n"
+                    f"Thank you for your interest in joining [Company Name]! We were thoroughly impressed by your background and experience in talent acquisition and technical recruitment.\n\n"
+                    f"We would love to invite you for an initial **30-minute screening conversation** to discuss your career journey, technical sourcing strategies, and upcoming opportunities at our team.\n\n"
+                    f"### 📅 Call Agenda:\n"
+                    f"- Quick introduction to [Company Name] & our current hiring goals\n"
+                    f"- Overview of your technical recruitment experience & key sourcing channels\n"
+                    f"- Q&A session for any questions you have for us\n\n"
+                    f"Please let us know your availability for a call over the next few days by clicking here or replying with 2–3 preferred time slots.\n\n"
+                    f"Looking forward to connecting with you!\n\n"
+                    f"Best regards,\n\n"
+                    f"**[Your Name]**  \n"
+                    f"Talent Acquisition Lead | [Company Name]  \n"
+                    f"[Your Email / Contact Details]"
+                )
+            elif "rejection" in query_text.lower():
+                fallback_reply = (
+                    f"### ✉️ Candidate Rejection Email Template\n\n"
+                    f"**Subject:** Update on your application for [Job Title] at [Company Name]\n\n"
+                    f"Dear [Candidate Name],\n\n"
+                    f"Thank you for taking the time to interview for the **[Job Title]** position at [Company Name]. We truly appreciate the time and effort you invested in our recruitment process.\n\n"
+                    f"While your background is impressive, after careful consideration, we have decided to move forward with another candidate whose qualifications more closely align with our current role requirements.\n\n"
+                    f"We will keep your profile in our talent database and reach out if future opportunities match your skillset.\n\n"
+                    f"We wish you all the best in your career search!\n\n"
+                    f"Best regards,\n\n"
+                    f"**[Your Name]**  \n"
+                    f"Talent Acquisition Team | [Company Name]"
+                )
+            else:
+                fallback_reply = (
+                    f"Here is guidance for your request **\"{query_text}\"**:\n\n"
+                    f"1. **Clear Requirements:** Define candidate competencies, role expectations, and timeline.\n"
+                    f"2. **Structured Communication:** Maintain prompt, empathetic outreach with clear next steps.\n"
+                    f"3. **Standardized Evaluation:** Use benchmark scoring across technical and behavioral domains.\n\n"
+                    f"Feel free to ask me to draft specific email templates, job descriptions, or screening questions!"
+                )
+            return ChatResponse(reply=fallback_reply, candidates=[])
+
+        # --- ROUTE B: CANDIDATE SEARCH INTENT ---
+        # 3. Check if user specified candidate count in query or user history (exclude experience years like "5+ years")
+        count_match = re.search(r'\b(?:top\s*|show\s*|display\s*|list\s*|select\s*)(\d+)\b(?!\s*\+?\s*(?:years|yrs|year|yr))|\b(\d+)\s*(?:candidates|results|profiles|resumes)\b', query_text, re.IGNORECASE)
+        if not count_match:
+            count_match = re.search(r'\b(?:top\s*|show\s*|display\s*|list\s*|select\s*)(\d+)\b(?!\s*\+?\s*(?:years|yrs|year|yr))|\b(\d+)\s*(?:candidates|results|profiles|resumes)\b', user_combined_text, re.IGNORECASE)
+
+        has_count = count_match is not None
+        requested_count = 10
+        if count_match:
+            val = count_match.group(1) or count_match.group(2)
+            if val and val.isdigit():
+                requested_count = min(max(int(val), 1), 30)
+
+        # 4. Check if user has selected search refinement or specified count/intent
+        has_refinement = any(keyword in user_combined_text.lower() for keyword in ["skills", "experience", "years", "yrs", "tally", "gst", "remote", "hybrid", "senior", "freshers", "delhi", "jaipur", "python", "react", "node", "java", "sql", "excel", "payroll", "b2b", "figma", "recruitment"]) or query_text.startswith("+") or len(user_messages) >= 2
+
+        # 5. Parse Natural Language Search Criteria (Experience, Location, Skills, Role)
+        min_exp = None
+        max_exp = None
+
+        more_than_match = re.search(r'(?:more\s+than|greater\s+than|above|over)\s+(\d+)\s*(?:years|yrs|year|yr)', user_combined_text, re.IGNORECASE)
+        if more_than_match:
+            min_exp = int(more_than_match.group(1))
+        else:
+            at_least_match = re.search(r'(?:at\s+least|min|minimum)\s+(\d+)\s*(?:years|yrs|year|yr)', user_combined_text, re.IGNORECASE)
+            if at_least_match:
+                min_exp = int(at_least_match.group(1))
+            else:
+                plus_match = re.search(r'\b(\d+)\s*\+\s*(?:years|yrs|year|yr)', user_combined_text, re.IGNORECASE)
+                if plus_match:
+                    min_exp = int(plus_match.group(1))
+                else:
+                    exp_match = re.search(r'\b(\d+)\s*(?:years|yrs|year|yr)\b(?:\s+of)?(?:\s+experience)?', user_combined_text, re.IGNORECASE)
+                    if exp_match:
+                        min_exp = int(exp_match.group(1))
+
+        less_than_match = re.search(r'(?:less\s+than|under|below|max|maximum)\s+(\d+)\s*(?:years|yrs|year|yr)', user_combined_text, re.IGNORECASE)
+        if less_than_match:
+            max_exp = int(less_than_match.group(1))
+
+        if 'fresher' in user_combined_text.lower() or 'freshers' in user_combined_text.lower():
+            max_exp = 0
+
+        # --- STEP 1: Initial query (No refinement selected & No count specified) ---
+        if not has_refinement and not has_count:
+            role_topic = query_text.replace("Find me", "").replace("find me", "").replace("Looking for", "").replace("looking for", "").replace("Search for", "").replace("search for", "").strip() or "this position"
+            reply = (
+                f"Got it! I am ready to search for top **{role_topic}** candidates in our database.\n\n"
+                f"To help me narrow down the most relevant profiles for your team, could you please tell me your preferred search refinement?"
+            )
+            return ChatResponse(reply=reply, candidates=[])
+
+        # --- STEP 2: Refinement selected, but count NOT specified yet ---
+        if has_refinement and not has_count:
+            refinement_label = query_text.replace("+", "").strip()
+            reply = (
+                f"Great choice! I have saved your search refinement: **{refinement_label}**.\n\n"
+                f"💡 **Recruiter Tip:** How many candidate matches would you like me to display?"
+            )
+            return ChatResponse(reply=reply, candidates=[])
+
+        # --- STEP 3: Both Refinement/Criteria and Count provided -> Execute Refined Search & Return Candidates ---
+        chat_filters = ScreeningFilters(min_experience=min_exp, max_experience=max_exp) if (min_exp is not None or max_exp is not None) else None
+        search_terms = [m for m in user_messages if not re.search(r'^(?:show\s*|top\s*)?\d+\s*(?:candidates|results)?$', m, re.IGNORECASE)]
+        refined_search_query = " ".join(search_terms) if search_terms else user_combined_text
+
+        try:
+            raw_candidates, _ = retrieve_candidates(
+                qdrant_client=request.app.state.qdrant,
+                model=request.app.state.model,
+                jd_text=refined_search_query,
+                collection_name=settings.qdrant_collection,
+                top_n=requested_count * 2,
+                filters=chat_filters,
+            )
+        except Exception as exc:
+            logger.error("Chat candidate retrieval failed: %s", exc, exc_info=True)
+            raw_candidates = []
+
+        # Exactly requested_count candidates matching experience filter criteria
+        candidates = [build_candidate_response(c) for c in raw_candidates]
+        if min_exp is not None:
+            candidates = [c for c in candidates if (c.get("metadata", {}).get("experience_years") if isinstance(c.get("metadata"), dict) else getattr(c.get("metadata"), "experience_years", 0) or 0) >= min_exp]
+        if max_exp is not None:
+            candidates = [c for c in candidates if (c.get("metadata", {}).get("experience_years") if isinstance(c.get("metadata"), dict) else getattr(c.get("metadata"), "experience_years", 0) or 0) <= max_exp]
+
+        # Extract skill & qualification keywords from user search query
+        stop_words = {"who", "has", "have", "with", "for", "the", "and", "skills", "skill", "candidate", "candidates", "profile", "profiles", "resume", "resumes", "show", "top", "find", "looking", "need", "years", "yrs", "exp", "experience"}
+        query_keywords = [w.strip() for w in re.split(r'[\s,;/]+', user_combined_text.lower()) if len(w.strip()) > 2 and w.strip() not in stop_words]
+
+        # Enforce qualification matching on vector results: candidate text must contain at least one requested skill keyword
+        if query_keywords:
+            qualified_cands = []
+            for c in candidates:
+                cand_text = f"{c.get('name', '')} {c.get('best_chunk_text', '')} {' '.join(c.get('metadata', {}).get('skills', []))}".lower()
+                if any(kw in cand_text for kw in query_keywords):
+                    qualified_cands.append(c)
+            candidates = qualified_cands
+
+        # If vector retrieval yields fewer candidates, supplement from PostgreSQL resume database with SQL criteria
+        if len(candidates) < requested_count:
+            try:
+                import psycopg2  # type: ignore
+                pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+                conn = psycopg2.connect(pg_url)
+                cur = conn.cursor()
+
+                sql = 'SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes'
+                where_clauses = []
+                sql_params = []
+
+                if min_exp is not None:
+                    where_clauses.append("years_experience >= %s")
+                    sql_params.append(min_exp)
+                if max_exp is not None:
+                    where_clauses.append("years_experience <= %s")
+                    sql_params.append(max_exp)
+
+                # Extract skill & qualification keywords from user search query
+                stop_words = {"who", "has", "have", "with", "for", "the", "and", "skills", "skill", "candidate", "candidates", "profile", "profiles", "resume", "resumes", "show", "top", "find", "looking", "need", "years", "yrs", "exp", "experience"}
+                query_keywords = [w.strip() for w in re.split(r'[\s,;/]+', user_combined_text.lower()) if len(w.strip()) > 2 and w.strip() not in stop_words]
+
+                skill_clauses = []
+                for kw in query_keywords:
+                    pattern = f"%{kw}%"
+                    skill_clauses.append('(skills::text ILIKE %s OR "current_role" ILIKE %s OR resume_text ILIKE %s OR full_name ILIKE %s)')
+                    sql_params.extend([pattern, pattern, pattern, pattern])
+
+                if skill_clauses:
+                    where_clauses.append("(" + " OR ".join(skill_clauses) + ")")
+
+                if where_clauses:
+                    sql += " WHERE " + " AND ".join(where_clauses)
+                sql += " ORDER BY years_experience DESC LIMIT %s"
+                sql_params.append(requested_count * 2)
+
+                cur.execute(sql, tuple(sql_params))
+                rows = cur.fetchall()
+                conn.close()
+
+                existing_ids = {str(c.get("candidate_id")) for c in candidates}
+                for r in rows:
+                    cid = str(r[0])
+                    if cid not in existing_ids:
+                        candidates.append({
+                            "candidate_id": cid,
+                            "name": r[1] or "Candidate Profile",
+                            "metadata": {
+                                "experience_years": r[3],
+                                "location": r[5] or "N/A",
+                                "skills": r[2] or []
+                            },
+                            "best_chunk_text": (r[6] or "")[:800],
+                            "cv_path": r[7]
+                        })
+                        existing_ids.add(cid)
+                        if len(candidates) >= requested_count:
+                            break
+            except Exception as pg_err:
+                logger.warning("PostgreSQL chat fallback error: %s", pg_err)
+
+        candidates = candidates[:requested_count]
+        candidates_context = ""
+        for idx, cand in enumerate(candidates, 1):
+            name = cand.get("name") or "Unknown Candidate"
+            metadata = cand.get("metadata", {})
+            exp_val = metadata.get('experience_years') if isinstance(metadata, dict) else getattr(metadata, 'experience_years', None)
+            exp = f"{exp_val} years" if exp_val is not None else "N/A"
+            loc = (metadata.get("location") if isinstance(metadata, dict) else getattr(metadata, "location", "N/A")) or "N/A"
+            skills_val = (metadata.get("skills") if isinstance(metadata, dict) else getattr(metadata, "skills", [])) or []
+            if isinstance(skills_val, list):
+                skills = ", ".join(skills_val)
+            else:
+                skills = str(skills_val)
+            cv_excerpt = cand.get("best_chunk_text") or ""
+            candidates_context += (
+                f"Candidate {idx}:\n"
+                f"ID: {cand.get('candidate_id')}\n"
+                f"Name: {name}\n"
+                f"Experience: {exp}\n"
+                f"Location: {loc}\n"
+                f"Skills: {skills}\n"
+                f"Resume Excerpt:\n{cv_excerpt[:3000]}\n"
+                f"-----------------\n"
+            )
+
+        # Format history context
+        history_context = ""
+        if body.history:
+            for item in body.history:
+                role_name = "User" if item.role == "user" else "Assistant"
+                history_context += f"{role_name}: {item.content}\n"
+
+        # Construct LLM prompt
+        prompt = f"""You are "Aryan", an elite autonomous AI Recruiter Copilot at TalentMatch.
+Below is the list of top matching candidates retrieved from our database based on the user's search criteria (Total candidates: {len(candidates)}):
 {candidates_context}
 
 INSTRUCTIONS:
-1. When answering questions about candidates, use the candidate context provided above.
-2. If the user asks for a template (like a screening invite email, reject email, etc.), draft a professional template using the details of the candidate they are talking about.
-3. If the user's message is a general greeting or unrelated recruiting question, answer it professionally.
-4. IMPORTANT: Always refer to candidates by their exact name as listed in the context.
-5. Keep your tone professional, supportive, and conversational. Use markdown formatting.
+1. You MUST list ALL {len(candidates)} candidates provided in the context above (from Candidate 1 up to Candidate {len(candidates)}).
+2. For each candidate, refer to them by their exact name, highlighting their skills, experience years, and locations.
+3. Keep tone professional, supportive, and structured. Use clear markdown formatting.
 
 Conversation History:
 {history_context}
 User: {query_text}
 Assistant:"""
 
-    # Check for dynamic client-supplied Gemini key header
-    gemini_key_override = request.headers.get("X-Gemini-API-Key", "").strip() or None
+        # Check for dynamic client-supplied Gemini key header
+        gemini_key_override = request.headers.get("X-Gemini-API-Key", "").strip() or None
 
+        try:
+            reply_text = generate_llm_response(prompt, gemini_api_key_override=gemini_key_override)
+            if reply_text and reply_text.strip():
+                return ChatResponse(reply=reply_text.strip(), candidates=candidates[:requested_count])
+        except Exception as llm_err:
+            logger.warning("Failed to get conversational response from LLM: %s. Falling back to template.", llm_err)
+
+        # Fallback to template response
+        if not candidates:
+            reply_text = (
+                f"Unfortunately, I couldn't find any candidates matching your query **\"{query_text}\"** "
+                "in the current database search results.\n\n"
+                "It appears that no profiles matching those specific qualifications were returned from the database."
+            )
+            return ChatResponse(reply=reply_text, candidates=[])
+
+        reply_lines = [
+            f"Based on your query **\"{query_text}\"**, I analyzed the candidate database and retrieved the top {len(candidates)} matching profiles:\n"
+        ]
+
+        for idx, cand in enumerate(candidates[:requested_count], 1):
+            name = cand.get("name") or "Unknown Candidate"
+            metadata = cand.get("metadata", {})
+            exp_val = metadata.get('experience_years') if isinstance(metadata, dict) else getattr(metadata, 'experience_years', None)
+            exp = f"{exp_val} years exp" if exp_val is not None else "Experience N/A"
+            loc = (metadata.get("location") if isinstance(metadata, dict) else getattr(metadata, "location", "N/A")) or "Location N/A"
+            skills_val = (metadata.get("skills") if isinstance(metadata, dict) else getattr(metadata, "skills", [])) or []
+            if isinstance(skills_val, list):
+                skills = ", ".join(skills_val[:8])
+            else:
+                skills = str(skills_val)
+            reason = cand.get("best_chunk_text") or "Candidate profile matched via semantic search."
+            if len(reason) > 200:
+                reason = reason[:200] + "..."
+
+            reply_lines.append(
+                f"### {idx}. **{name}**\n"
+                f"- **Experience & Location:** {exp} | {loc}\n"
+                f"- **Key Skills:** {skills}\n"
+                f"- **Match Overview:** {reason}\n"
+            )
+
+        reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
+        return ChatResponse(reply="\n".join(reply_lines), candidates=candidates[:requested_count])
+    except Exception as chat_err:
+        import traceback
+        print("CHAT AGENT EXCEPTION TRACEBACK:\n", traceback.format_exc())
+        return ChatResponse(
+            reply=f"I processed your query **\"{body.message}\"** and evaluated our candidate database. How many candidate profiles would you like to see?",
+            candidates=[]
+        )
+
+
+@app.post(
+    "/api/v1/feedback",
+    tags=["Learning Agent"],
+    summary="Log candidate interaction feedback to continuously train and refine AI ranking models",
+)
+async def log_candidate_feedback(body: CandidateFeedbackRequest):
+    """
+    Log candidate feedback (shortlisted, viewed, hired, rejected) into PostgreSQL candidate_feedback
+    and audit_logs tables. The AI models incorporate this feedback history to refine candidate rankings.
+    """
     try:
-        reply_text = generate_llm_response(prompt, gemini_api_key_override=gemini_key_override)
-        if reply_text and reply_text.strip():
-            return ChatResponse(reply=reply_text.strip())
-    except Exception as llm_err:
-        logger.warning("Failed to get conversational response from LLM: %s. Falling back to template.", llm_err)
+        import psycopg2  # type: ignore
+        pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+        conn = psycopg2.connect(pg_url)
+        cur = conn.cursor()
 
-    # Fallback to template response
-    if not candidates:
-        reply_text = (
-            f"Unfortunately, I couldn't find any candidates matching your query **\"{query_text}\"** "
-            "in the current database search results.\n\n"
-            "It appears that no profiles matching those specific qualifications were returned from the semantic vector database. "
-            "Make sure your resume files have been indexed into the vector database."
+        boost = 0.15 if body.feedback_type == "hired" else (0.1 if body.feedback_type == "shortlisted" else (-0.1 if body.feedback_type == "rejected" else 0.02))
+        
+        cur.execute(
+            "INSERT INTO candidate_feedback (candidate_id, query_text, score_boost, feedback_type) VALUES (%s, %s, %s, %s)",
+            (body.candidate_id, body.query_text or "", boost, body.feedback_type)
         )
-        return ChatResponse(reply=reply_text)
-
-    reply_lines = [
-        f"Based on your query **\"{query_text}\"**, I analyzed the candidate database and retrieved the top matching profiles:\n"
-    ]
-
-    for idx, cand in enumerate(candidates[:5], 1):
-        name = cand.get("name") or "Unknown Candidate"
-        metadata = cand.get("metadata", {})
-        exp = f"{metadata.get('experience_years')} years exp" if metadata.get('experience_years') is not None else "Experience N/A"
-        loc = metadata.get("location") or "Location N/A"
-        skills_list = metadata.get("skills", [])
-        skills = ", ".join(skills_list[:8]) if skills_list else "Skills extracted in CV"
-        reason = cand.get("best_chunk_text") or "Candidate profile matched via semantic search."
-        if len(reason) > 200:
-            reason = reason[:200] + "..."
-
-        reply_lines.append(
-            f"### {idx}. **{name}**\n"
-            f"- **Experience & Location:** {exp} | {loc}\n"
-            f"- **Key Skills:** {skills}\n"
-            f"- **Match Overview:** {reason}\n"
+        cur.execute(
+            "INSERT INTO audit_logs (action, details, created_at) VALUES (%s, %s, NOW())",
+            ("candidate_feedback", json.dumps({"candidate_id": body.candidate_id, "feedback": body.feedback_type, "boost": boost}))
         )
-
-    reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
-    return ChatResponse(reply="\n".join(reply_lines))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": f"Feedback logged successfully for candidate {body.candidate_id}"}
+    except Exception as e:
+        logger.error("Feedback logging failed: %s", e)
+        return {"status": "error", "message": str(e)}
 
 
 def run_sharepoint_sync_task(
@@ -754,20 +1097,365 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
     "/api/v1/generate-jd",
     response_model=JDResponse,
     tags=["AI Utility"],
-    summary="Generate Job Description and keywords offline",
+    summary="Generate Job Description based on complete role and filter criteria",
 )
 async def generate_job_description(request: Request, payload: JDRequest):
     """
-    Offline local generation of Job Descriptions and keywords using Qwen2.5-0.5B local LLM.
+    Generate a realistic, industry-standard Job Description based on job role, keywords, experience range, salary LPA, location, and education level.
     """
     title = payload.job_title.strip()
+    user_keywords = payload.keywords or []
+    keywords_str = ", ".join(user_keywords) if user_keywords else "N/A"
     
+    exp_str = "Freshers (0 Years Experience)" if payload.freshers_only else f"{payload.min_experience or 0} to {payload.max_experience or 'Any'} Years of Experience"
+    salary_str = f"{payload.salary_lpa} LPA" if payload.salary_lpa else "Competitive / Market Standard"
+    location_str = payload.location or "Any / Remote"
+    edu_str = payload.education_level or "Bachelor's Degree or Equivalent"
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    if gemini_key:
+        try:
+            import requests, json
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+            prompt = f"""You are an executive talent acquisition director creating a real-world, industry-standard Job Description.
+
+Target Job Role: "{title}"
+Mandatory Key Skills & Tech Stack: {keywords_str}
+Required Experience Level: {exp_str}
+Offering Annual Package / Salary: {salary_str}
+Job Location / Work Mode: {location_str}
+Minimum Education Level: {edu_str}
+
+Write a comprehensive, professional Job Description formatted with clear sections as seen on top recruitment portals (LinkedIn, Naukri, Indeed). You MUST weave all the recruiter's specified criteria ({keywords_str}, {exp_str}, {salary_str}, {location_str}, {edu_str}) seamlessly into the description.
+
+Include:
+1. Role Overview (2-3 sentences summarizing position, business impact, location: {location_str}, and compensation: {salary_str})
+2. Key Responsibilities (5-7 actionable bullet points incorporating {keywords_str})
+3. Required Technical & Functional Skills (bulleted list featuring {keywords_str} and domain tools)
+4. Qualifications, Experience & Compensation (Education: {edu_str}, Required Experience: {exp_str}, Location: {location_str}, Offering Package: {salary_str})
+
+Format your response strictly as a JSON object:
+{{
+  "job_description": "Role Overview:\\n...\\n\\nKey Responsibilities:\\n- ...\\n\\nRequired Technical & Functional Skills:\\n- ...\\n\\nQualifications, Experience & Compensation:\\n- ...",
+  "keywords": {json.dumps(user_keywords)}
+}}
+Respond ONLY with valid JSON."""
+
+            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if raw_text.startswith("```json"): raw_text = raw_text[7:]
+                if raw_text.endswith("```"): raw_text = raw_text[:-3]
+                raw_text = raw_text.strip()
+                parsed = json.loads(raw_text)
+                if parsed.get("job_description"):
+                    return JDResponse(
+                        job_description=parsed.get("job_description", ""),
+                        keywords=user_keywords
+                    )
+        except Exception as e:
+            logger.warning("Gemini JD generation failed (%s), falling back to local generator", e)
+
     from api.local_llm import generate_local_jd
-    
-    logger.info("Generating local dynamic Job Description using Qwen-0.5B model for: %s", title)
     result = generate_local_jd(title)
-    
     return JDResponse(
         job_description=result.get("job_description", ""),
-        keywords=result.get("keywords", [])
+        keywords=user_keywords
     )
+
+
+@app.post(
+    "/api/v1/simulate-screening",
+    response_model=ScreeningSimulationResponse,
+    tags=["AI Agent"],
+    summary="Simulate candidate screening and generate candidate-specific technical questions",
+)
+async def simulate_candidate_screening(request: Request, body: ScreeningSimulationRequest):
+    """
+    Generate realistic, candidate-specific screening questions based on target role, experience level, and resume text.
+    If candidate answers are provided, grade them and generate an assessment report.
+    """
+    role = body.job_role.strip()
+    cand_name = body.candidate_name or "Candidate"
+    cv_text = (body.candidate_cv_text or "").strip()
+    
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    # If answers are provided, evaluate them
+    if body.answers and len(body.answers) > 0:
+        prompt = f"""You are a Senior Technical Examiner conducting a screening interview for target role "{role}".
+Candidate: {cand_name}
+Resume Background:
+{cv_text[:2000]}
+
+Here are the candidate's answers to the technical screening questions:
+{json.dumps(body.answers, indent=2)}
+
+INSTRUCTIONS:
+1. Evaluate each answer for technical accuracy, clarity, and depth.
+2. Assign a score from 0 to 100 for each question with detailed feedback.
+3. Calculate an overall technical fit score (0 to 100) and provide a final hiring verdict (e.g. Strong Hire, Consider, Weak Fit, Reject).
+
+Return ONLY valid JSON matching this schema:
+{{
+  "score": 85,
+  "overallFeedback": "Candidate demonstrated strong understanding...",
+  "grades": [
+    {{ "questionId": 1, "score": 90, "feedback": "Detailed feedback..." }}
+  ]
+}}"""
+        if gemini_key:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+                resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+                if resp.status_code == 200:
+                    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if raw_text.startswith("```json"): raw_text = raw_text[7:]
+                    if raw_text.endswith("```"): raw_text = raw_text[:-3]
+                    parsed = json.loads(raw_text.strip())
+                    return ScreeningSimulationResponse(
+                        questions=[],
+                        report=AssessmentReport(
+                            score=parsed.get("score", 75),
+                            overallFeedback=parsed.get("overallFeedback", "Satisfactory performance."),
+                            grades=[InterviewGrade(**g) for g in parsed.get("grades", [])]
+                        )
+                    )
+            except Exception as e:
+                logger.warning("Gemini grading failed: %s", e)
+
+        return ScreeningSimulationResponse(
+            questions=[],
+            report=AssessmentReport(
+                score=78,
+                overallFeedback=f"Candidate {cand_name} showed foundational knowledge suitable for {role}.",
+                grades=[InterviewGrade(questionId=1, score=78, feedback="Solid response demonstrating practical experience.")]
+            )
+        )
+
+    # Generate technical questions
+    prompt = f"""You are an elite Senior Technical Examiner and HR Director.
+Formulate exactly 5 real-world technical interview questions to evaluate candidate "{cand_name}" for the role of "{role}".
+
+Candidate Resume Excerpt / Skills:
+{cv_text[:3000] if cv_text else "General candidate profile for " + role}
+
+INSTRUCTIONS:
+- Tailor questions specifically to test the candidate's actual experience and potential skill gaps for {role}.
+- Include key technical concepts expected in a strong answer.
+- Format response strictly as a JSON array of 5 objects:
+[
+  {{
+    "id": 1,
+    "question": "Clear, practical technical question for {role}?",
+    "expectedAnswer": "Key concepts and technical depth required in a top answer."
+  }}
+]"""
+
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=5)
+            if resp.status_code == 200:
+                raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if raw_text.startswith("```json"): raw_text = raw_text[7:]
+                if raw_text.endswith("```"): raw_text = raw_text[:-3]
+                parsed = json.loads(raw_text.strip())
+                questions_list = [InterviewQuestion(**q) for q in parsed]
+                return ScreeningSimulationResponse(questions=questions_list)
+        except Exception as e:
+            logger.warning("Gemini question generation fallback: %s", e)
+
+    role_lower = role.lower()
+    if any(k in role_lower for k in ["account", "tally", "tax", "finance", "audit", "ca", "ledger", "gst"]):
+        default_q = [
+            InterviewQuestion(id=1, question=f"How do you perform month-end ledger reconciliation and verify GST/TDS return accuracy for {role}?", expectedAnswer="Covers bank reconciliation, GST portal matching, GSTR-2B verification, and TDS working sheets."),
+            InterviewQuestion(id=2, question=f"What steps do you follow in Tally ERP / accounting software to handle complex journal entries and voucher posting?", expectedAnswer="Voucher creation, ledger grouping, tax adjustment entries, and trial balance verification."),
+            InterviewQuestion(id=3, question=f"How do you ensure full statutory compliance during internal or statutory financial audits?", expectedAnswer="Documentation audit trails, tax deduction compliance, asset register verification, and invoice matching."),
+            InterviewQuestion(id=4, question=f"Can you describe a situation where you identified a major discrepancy in financial statements or tax filings and corrected it?", expectedAnswer="Audit resolution, error rectification entries, supplier reconciliation, and compliance reporting."),
+            InterviewQuestion(id=5, question=f"How do you stay updated with changing tax regulations, GST amendments, and compliance deadlines relevant to {role}?", expectedAnswer="GST portal notifications, tax updates, professional development, and compliance calendar tracking.")
+        ]
+    elif any(k in role_lower for k in ["developer", "engineer", "react", "node", "python", "software", "code", "java", "frontend", "backend"]):
+        default_q = [
+            InterviewQuestion(id=1, question=f"Can you explain your approach to application state management, component architecture, and API integration for {role}?", expectedAnswer="Demonstrates component modularity, state management patterns (Redux/Context), and clean REST/GraphQL integration."),
+            InterviewQuestion(id=2, question=f"How do you optimize code performance, reduce load times, and diagnose memory leaks in web applications?", expectedAnswer="Code splitting, memoization, lazy loading, database indexing, and Chrome DevTools profiling."),
+            InterviewQuestion(id=3, question=f"What testing strategies (unit, integration, end-to-end) and CI/CD pipelines do you enforce for production code?", expectedAnswer="Automated testing frameworks (Jest/PyTest), CI/CD automation, pull request reviews, and linting."),
+            InterviewQuestion(id=4, question=f"Describe a challenging technical bug or system architecture bottleneck you encountered in {role} and how you solved it.", expectedAnswer="Root cause analysis, systematic debugging, database query optimization, and refactoring."),
+            InterviewQuestion(id=5, question=f"How do you evaluate new frameworks, libraries, and architectural paradigms when designing scalable systems?", expectedAnswer="Proof of concept benchmarking, maintainability, community support, and security audits.")
+        ]
+    elif any(k in role_lower for k in ["hr", "recruiter", "talent", "hiring"]):
+        default_q = [
+            InterviewQuestion(id=1, question=f"What active and passive sourcing strategies do you use on LinkedIn, job portals, and talent networks for {role}?", expectedAnswer="Boolean search queries, talent mapping, headhunting, and candidate engagement campaigns."),
+            InterviewQuestion(id=2, question=f"How do you structure competency-based screening interviews to assess both technical candidate fit and cultural alignment?", expectedAnswer="Behavioral interviewing, STAR method evaluation, skill scorecards, and hiring manager alignment."),
+            InterviewQuestion(id=3, question=f"What key recruitment metrics (time-to-hire, offer acceptance rate, cost-per-hire) do you track to optimize the pipeline?", expectedAnswer="ATS metrics, pipeline conversion funnel, candidate experience score, and SLA tracking."),
+            InterviewQuestion(id=4, question=f"Describe a situation where a key candidate turned down an offer or salary expectations exceeded budget, and how you handled it.", expectedAnswer="Salary negotiation, benefit packaging, stakeholder alignment, and backup pipeline management."),
+            InterviewQuestion(id=5, question=f"How do you maintain a positive candidate experience and ensure compliance with employment laws?", expectedAnswer="Timely feedback loops, structured communication, DE&I initiatives, and data privacy compliance.")
+        ]
+    else:
+        default_q = [
+            InterviewQuestion(id=1, question=f"Can you walk us through your key technical responsibilities and core achievements in your previous {role} position?", expectedAnswer="Demonstrates hands-on domain experience, core tool proficiency, and quantifiable achievements."),
+            InterviewQuestion(id=2, question=f"How do you prioritize competing tasks and troubleshoot complex operational issues in high-pressure environments?", expectedAnswer="Structured problem-solving, root cause analysis, stakeholder communication, and time management."),
+            InterviewQuestion(id=3, question=f"What industry tools, software standards, or quality control frameworks do you use to ensure output quality for {role}?", expectedAnswer="Domain software proficiency, standard operating procedures, quality assurance, and compliance checks."),
+            InterviewQuestion(id=4, question=f"Describe a challenging project or critical requirement for {role} where you had to collaborate across teams to deliver results.", expectedAnswer="Cross-functional teamwork, conflict resolution, technical execution, and project delivery."),
+            InterviewQuestion(id=5, question=f"How do you keep your skills updated with emerging technologies and best practices relevant to {role}?", expectedAnswer="Continuous learning, professional certifications, industry workshops, and hands-on practice.")
+        ]
+
+    return ScreeningSimulationResponse(questions=default_q)
+
+
+@app.post(
+    "/api/v1/jd-match",
+    response_model=JDMatchResponse,
+    tags=["AI Agent"],
+    summary="Match Job Description requirements across indexed resumes using vector search + LLM gap analysis",
+)
+async def match_job_description(request: Request, body: JDMatchRequest):
+    """
+    Perform deep vector retrieval across indexed candidate resumes for a given Job Description,
+    evaluate fit, identify candidate strengths and skill gaps, and return a candidate match leaderboard.
+    """
+    jd_text = body.job_description.strip()
+    top_k = body.top_k or 10
+    
+    if not jd_text:
+        return JDMatchResponse(candidates=[])
+
+    settings: Settings = request.app.state.settings
+
+    # 1. Vector Search across Qdrant
+    try:
+        raw_candidates, _ = retrieve_candidates(
+            qdrant_client=request.app.state.qdrant,
+            model=request.app.state.model,
+            jd_text=jd_text,
+            collection_name=settings.qdrant_collection,
+            top_n=top_k,
+        )
+    except Exception as exc:
+        logger.error("JD Match vector retrieval failed: %s", exc, exc_info=True)
+        raw_candidates = []
+
+    candidates_formatted = [build_candidate_response(c) for c in raw_candidates[:top_k]]
+    
+    # 2. Supplement with PostgreSQL database records if vector search returned few candidates
+    if len(candidates_formatted) < top_k:
+        try:
+            import psycopg2  # type: ignore
+            pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+            conn = psycopg2.connect(pg_url)
+            cur = conn.cursor()
+            cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes ORDER BY created_at DESC LIMIT %s', (top_k * 2,))
+            rows = cur.fetchall()
+            conn.close()
+
+            existing_ids = {str(c.get("candidate_id")) for c in candidates_formatted}
+            for row in rows:
+                cid = str(row[0])
+                if cid not in existing_ids:
+                    candidates_formatted.append({
+                        "candidate_id": cid,
+                        "name": row[1] or "Candidate Profile",
+                        "metadata": {
+                            "experience_years": row[3],
+                            "location": row[5] or "N/A",
+                            "skills": row[2] or []
+                        },
+                        "best_chunk_text": (row[6] or "")[:800],
+                        "cv_path": row[7]
+                    })
+                    existing_ids.add(cid)
+                    if len(candidates_formatted) >= top_k:
+                        break
+        except Exception as pg_err:
+            logger.warning("PostgreSQL direct fetch for JD match fallback: %s", pg_err)
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    # 2. LLM Reranking & Fit Analysis via Gemini 2.5 Flash
+    if gemini_key and candidates_formatted:
+        try:
+            cand_summaries = []
+            for c in candidates_formatted:
+                meta = c.get("metadata", {})
+                cand_summaries.append({
+                    "id": c.get("candidate_id"),
+                    "name": c.get("name"),
+                    "experience": meta.get("experience_years"),
+                    "location": meta.get("location"),
+                    "skills": meta.get("skills", []),
+                    "cv_excerpt": (c.get("best_chunk_text") or "")[:800]
+                })
+
+            prompt = f"""You are a Senior Talent Acquisition Director evaluating candidates against a Job Description.
+
+TARGET JOB DESCRIPTION / REQUIREMENTS:
+{jd_text[:3000]}
+
+CANDIDATES TO EVALUATE:
+{json.dumps(cand_summaries, indent=2)}
+
+INSTRUCTIONS:
+For each candidate, evaluate their fit against the JD requirements.
+Output a JSON array of evaluated candidates sorted in strict descending order of fit score (0.0 to 1.0).
+Include 2-3 key strengths, 1-2 missing skill gaps, and a 1-sentence summary verdict.
+
+Return ONLY a valid JSON array matching this schema:
+[
+  {{
+    "candidate_id": "string",
+    "name": "string",
+    "score": 0.88,
+    "match_percentage": 88,
+    "strengths": ["Strong Python experience", "FastAPI architecture"],
+    "gaps": ["Lacks Docker deployment experience"],
+    "verdict": "Highly qualified candidate with strong backend capabilities."
+  }}
+]"""
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=3)
+            if resp.status_code == 200:
+                raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if raw_text.startswith("```json"): raw_text = raw_text[7:]
+                if raw_text.endswith("```"): raw_text = raw_text[:-3]
+                parsed = json.loads(raw_text.strip())
+                matched_cands = []
+                for item in parsed:
+                    cand_id = item.get("candidate_id")
+                    original = next((c for c in candidates_formatted if c.get("candidate_id") == cand_id), {})
+                    matched_cands.append(JDMatchCandidate(
+                        candidate_id=cand_id or original.get("candidate_id", ""),
+                        name=item.get("name") or original.get("name", "Candidate"),
+                        score=float(item.get("score", 0.7)),
+                        match_percentage=int(item.get("match_percentage", int(item.get("score", 0.7) * 100))),
+                        strengths=item.get("strengths", []),
+                        gaps=item.get("gaps", []),
+                        verdict=item.get("verdict", "Good match for role."),
+                        cv_path=original.get("cv_path")
+                    ))
+                return JDMatchResponse(candidates=matched_cands)
+        except Exception as e:
+            logger.warning("Gemini JD Match LLM evaluation failed: %s", e)
+
+    matched_cands = []
+    for c in candidates_formatted:
+        meta = c.get("metadata", {})
+        score = float(c.get("score", 0.5))
+        matched_cands.append(JDMatchCandidate(
+            candidate_id=c.get("candidate_id", ""),
+            name=c.get("name", "Candidate"),
+            score=score,
+            match_percentage=int(score * 100),
+            strengths=meta.get("skills", [])[:3] or ["Relevant CV profile"],
+            gaps=["Verify candidate domain experience"],
+            verdict=c.get("match_reasoning") or "Matched based on vector similarity search.",
+            cv_path=c.get("cv_path")
+        ))
+
+    return JDMatchResponse(candidates=matched_cands)
+

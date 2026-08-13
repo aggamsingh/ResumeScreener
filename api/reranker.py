@@ -30,7 +30,7 @@ GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "4"))
 
 # Maximum candidates sent to the LLM in a single prompt.
 # With 800-char excerpts + metadata, 15 candidates fit comfortably in
@@ -43,10 +43,9 @@ _MAX_LLM_CANDIDATES = 15
 
 def _build_prompt(jd_text: str, candidates: list[dict[str, Any]], top_k: int) -> str:
     def _candidate_block(i: int, c: dict) -> str:
-        meta = c.get("metadata", {})
+        meta = c.get("metadata") or {}
         lines = [
-            f"--- Candidate {i + 1} ---",
-            f"ID: {c['candidate_id']}",
+            f"Candidate ID: {c['candidate_id']}",
             f"Name: {c['name']}",
         ]
         if meta.get("experience_years") is not None:
@@ -55,37 +54,37 @@ def _build_prompt(jd_text: str, candidates: list[dict[str, Any]], top_k: int) ->
             lines.append(f"Location: {meta['location']}")
         if meta.get("skills"):
             lines.append(f"Key Skills: {', '.join(meta['skills'][:15])}")
-        lines.append(f"CV Excerpt:\n{c['best_chunk_text'][:3000]}")
+        lines.append(f"CV Excerpt:\n{c['best_chunk_text'][:1000]}")
         return "\n".join(lines)
 
     candidate_sections = "\n\n".join(
         _candidate_block(i, c) for i, c in enumerate(candidates)
     )
 
-    return f"""You are an expert recruitment assistant helping an HR team shortlist candidates.
+    return f"""You are an elite AI Talent Acquisition Lead evaluating candidate resumes for a target job opening.
 
-JOB DESCRIPTION:
+TARGET JOB ROLE & REQUIREMENTS:
 {jd_text[:10000]}
 
 CANDIDATES TO EVALUATE:
 {candidate_sections}
 
-TASK:
-1. Select the top {top_k} most suitable candidates for this role.
-2. Assign each a fit score from 0.0 (no fit) to 1.0 (perfect fit).
-3. Write one concise sentence explaining why each candidate is a good fit.
+EVALUATION & RANKING INSTRUCTIONS:
+1. Re-rank the candidates so that the MOST RELEVANT candidate appears FIRST (Rank #1 at the top of the list).
+2. Rank #1 MUST be the candidate whose experience, exact job title alignment, and technical skills match the target job requirements most strongly.
+3. Calculate a precise match score from 0.00 to 1.00 for each candidate based on:
+   - Job Title & Domain Alignment (highest weight)
+   - Mandatory Skill & Tech Stack Match
+   - Experience Seniority Alignment
+4. Provide a crisp 2-sentence match reasoning highlighting matching skills, years of experience, and domain fit.
+5. Return the JSON array sorted in STRICT DESCENDING ORDER of score (highest match score first).
 
-RULES:
-- Base your ranking on skills, experience, and role alignment.
-- Consider any location or experience requirements mentioned in the job description.
-- Return ONLY valid JSON — no markdown, no preamble, no explanation outside the JSON.
-
-REQUIRED OUTPUT FORMAT:
+REQUIRED JSON FORMAT:
 [
   {{
     "candidate_id": "<exact id from above>",
-    "score": 0.95,
-    "reasoning": "Concise one-sentence explanation of fit."
+    "score": 0.96,
+    "reasoning": "Top match: Possesses direct experience as Senior Accountant with 5+ years in Tally ERP, GST filing, and Bank Reconciliation."
   }}
 ]"""
 
@@ -283,9 +282,32 @@ def _get_model_name() -> str:
     return GROQ_MODEL if LLM_PROVIDER == "groq" else GEMINI_MODEL
 
 
+def _apply_historical_feedback(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Query PostgreSQL candidate_feedback table and adjust scores based on past recruiter feedback."""
+    try:
+        import psycopg2
+        pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+        conn = psycopg2.connect(pg_url)
+        cur = conn.cursor()
+        cur.execute("SELECT candidate_id, SUM(score_boost) FROM candidate_feedback GROUP BY candidate_id")
+        feedback_map = {str(r[0]): float(r[1]) for r in cur.fetchall()}
+        conn.close()
+
+        for c in candidates:
+            cid = str(c.get("candidate_id"))
+            if cid in feedback_map:
+                boost = feedback_map[cid]
+                base_score = c.get("best_score", 0.7)
+                c["best_score"] = min(1.0, max(0.0, base_score + boost))
+    except Exception as e:
+        logger.debug("Could not fetch candidate feedback boosts: %s", e)
+    return candidates
+
+
 def _fallback_ranking(candidates: list[dict[str, Any]], top_k: int) -> list[Candidate]:
-    """Return candidates sorted by Qdrant vector score when LLM is unavailable."""
-    sorted_candidates = sorted(candidates, key=lambda x: x["best_score"], reverse=True)
+    """Return candidates sorted by vector score + historical feedback boosts when LLM is unavailable."""
+    candidates = _apply_historical_feedback(candidates)
+    sorted_candidates = sorted(candidates, key=lambda x: x.get("best_score", 0.0), reverse=True)
     return [
         Candidate(
             candidate_id=c["candidate_id"],

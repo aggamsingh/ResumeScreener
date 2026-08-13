@@ -45,7 +45,7 @@ def _check_experience(
     Check experience_years against min/max filter.
 
     Returns (passes: bool, flags: list[str]).
-    flags is non-empty when the check couldn't be done due to missing data.
+    flags is non-empty when data is missing or soft filter flags apply.
     """
     flags: list[str] = []
     exp = candidate.get("experience_years")
@@ -56,14 +56,17 @@ def _check_experience(
 
     if exp is None:
         flags.append("experience_unknown")
-        # strict=True: exclude unknown; strict=False: include with flag
         return not filters.strict, flags
 
     if filters.min_experience is not None and exp < filters.min_experience:
-        return False, flags
+        if filters.strict:
+            return False, flags
+        flags.append(f"exp_below_min ({exp}y < {filters.min_experience}y)")
 
     if filters.max_experience is not None and exp > filters.max_experience:
-        return False, flags
+        if filters.strict:
+            return False, flags
+        flags.append(f"exp_above_max ({exp}y > {filters.max_experience}y)")
 
     return True, flags
 
@@ -75,9 +78,8 @@ def _check_location(
     """
     Check location against filter string (case-insensitive substring match).
 
-    We check both location (canonical) and location_raw to maximise recall.
-    E.g. filter='Delhi' will match:
-      location='Delhi NCR', location_raw='New Delhi, India'
+    Allows 'remote', 'any', 'flexible', 'open', 'worldwide', 'hybrid' to match all candidates.
+    If strict=False, non-matching location adds a soft flag instead of excluding candidates.
     """
     flags: list[str] = []
 
@@ -85,14 +87,22 @@ def _check_location(
         return True, flags
 
     filter_loc = filters.location.lower().strip()
+    if filter_loc in ("remote", "any", "flexible", "open", "worldwide", "hybrid", "all"):
+        return True, flags
+
     loc_canonical = (candidate.get("location") or "").lower()
     loc_raw       = (candidate.get("location_raw") or "").lower()
+    chunk_text    = (candidate.get("best_chunk_text") or "").lower()
 
     if not loc_canonical and not loc_raw:
         flags.append("location_unknown")
         return not filters.strict, flags
 
-    if filter_loc in loc_canonical or filter_loc in loc_raw:
+    if filter_loc in loc_canonical or filter_loc in loc_raw or filter_loc in chunk_text:
+        return True, flags
+
+    if not filters.strict:
+        flags.append(f"location_mismatch ({candidate.get('location') or 'unknown'})")
         return True, flags
 
     return False, flags
@@ -103,8 +113,8 @@ def _check_skills(
     filters: ScreeningFilters,
 ) -> tuple[bool, list[str]]:
     """
-    Check that ALL required_skills appear in the candidate's skill list.
-    Comparison is case-insensitive.
+    Check that required_skills appear in candidate skills or text.
+    If strict=True, requires ALL skills. If strict=False, treats missing skills as soft flags.
     """
     flags: list[str] = []
 
@@ -112,14 +122,18 @@ def _check_skills(
         return True, flags
 
     candidate_skills_lower = {s.lower() for s in (candidate.get("skills") or [])}
+    chunk_text_lower = (candidate.get("best_chunk_text") or "").lower()
 
     missing = [
         s for s in filters.required_skills
-        if s.lower() not in candidate_skills_lower
+        if s.lower() not in candidate_skills_lower and s.lower() not in chunk_text_lower
     ]
 
     if missing:
-        return False, flags
+        if filters.strict:
+            return False, flags
+        else:
+            flags.append(f"SKILLS_PARTIAL: missing [{', '.join(missing)}]")
 
     return True, flags
 
@@ -173,13 +187,72 @@ def _apply_filters(
     return passing, filtered_out
 
 
-# ── Deduplication ──────────────────────────────────────────────────────────────
+def _calculate_qualification_score(
+    candidate: dict[str, Any], 
+    jd_text: str,
+    filters: Optional[ScreeningFilters] = None
+) -> float:
+    """
+    Compute a high-precision hybrid qualification match score (0.0 to 1.0)
+    optimized for Job Title alignment, exact keyword matching, and experience fit.
+    """
+    if not jd_text:
+        return float(candidate.get("best_score", 0.5))
 
-def _deduplicate(hits: list) -> list[dict[str, Any]]:
+    jd_lower = jd_text.lower()
+    candidate_skills = [s.lower() for s in (candidate.get("skills") or [])]
+    chunk_text_lower = (candidate.get("best_chunk_text") or "").lower()
+    candidate_name = (candidate.get("name") or "").lower()
+    
+    # 1. Skill Matrix Overlap Score (Weight: 35%)
+    req_skills = [s.lower() for s in (filters.required_skills if filters and filters.required_skills else [])]
+    if req_skills:
+        matched_req = sum(1 for req in req_skills if req in candidate_skills or req in chunk_text_lower)
+        skill_score = matched_req / max(1, len(req_skills))
+    elif candidate_skills:
+        matched_in_jd = sum(1 for s in candidate_skills if s in jd_lower)
+        skill_score = matched_in_jd / max(1, len(candidate_skills))
+    else:
+        skill_score = 0.3
+
+    # 2. Job Title & Role Keyword Alignment (Weight: 30%)
+    stop_words = {"a", "an", "and", "or", "the", "in", "of", "for", "with", "to", "at", "by", "on", "target", "job", "title"}
+    jd_words = [w for w in jd_lower.split() if len(w) > 2 and w not in stop_words][:8]
+    title_matches = sum(1 for w in jd_words if w in candidate_name or w in chunk_text_lower[:600])
+    title_score = min(1.0, title_matches / max(1, min(4, len(jd_words))))
+
+    # 3. Experience Range Fit (Weight: 15%)
+    exp = candidate.get("experience_years")
+    exp_score = 0.5
+    if exp is not None and filters:
+        min_e = filters.min_experience
+        max_e = filters.max_experience
+        if min_e is not None and max_e is not None:
+            if min_e <= exp <= max_e:
+                exp_score = 1.0
+            elif exp >= min_e:
+                exp_score = 0.8
+            else:
+                exp_score = 0.3
+        elif min_e is not None and exp >= min_e:
+            exp_score = 1.0
+        elif max_e is not None and exp <= max_e:
+            exp_score = 1.0
+
+    # 4. Dense Vector Cosine Similarity (Weight: 20%)
+    raw_vector_score = float(candidate.get("best_score", 0.5))
+
+    # Hybrid Score Fusion: Skill Matrix (35%) + Title Alignment (30%) + Vector Similarity (20%) + Experience Fit (15%)
+    final_score = (skill_score * 0.35) + (title_score * 0.30) + (raw_vector_score * 0.20) + (exp_score * 0.15)
+    
+    return min(1.0, max(0.0, round(final_score, 4)))
+
+
+def _deduplicate(hits: list, jd_text: str = "", filters: Optional[ScreeningFilters] = None) -> list[dict[str, Any]]:
     """
     Deduplicate Qdrant search hits by candidate_id.
     Keeps the highest-scoring chunk per candidate and merges metadata.
-    Returns list sorted by best_score descending.
+    Calculates a high-precision hybrid qualification match score.
     """
     best: dict[str, dict[str, Any]] = {}
 
@@ -203,6 +276,10 @@ def _deduplicate(hits: list) -> list[dict[str, Any]]:
                 "email":            payload.get("email"),
                 "ocr_used":         payload.get("ocr_used", False),
             }
+
+    # Enhance candidate scores using hybrid qualification matrix analysis
+    for cand in best.values():
+        cand["best_score"] = _calculate_qualification_score(cand, jd_text, filters)
 
     return sorted(best.values(), key=lambda x: x["best_score"], reverse=True)
 
@@ -281,8 +358,8 @@ def retrieve_candidates(
         logger.warning("Qdrant returned zero results — is the collection indexed?")
         return [], 0
 
-    # ── Deduplicate ───────────────────────────────────────────────
-    candidates = _deduplicate(hits)
+    # ── Deduplicate & Hybrid Score ────────────────────────────────
+    candidates = _deduplicate(hits, jd_text=jd_text, filters=effective_filters)
     logger.info(
         "Retrieved %d chunks -> %d unique candidates after deduplication",
         len(hits),
@@ -302,18 +379,21 @@ def build_candidate_response(raw: dict[str, Any]) -> dict[str, Any]:
 
     Separates the metadata fields into a nested CandidateMetadata-shaped dict.
     """
-    return {
-        "candidate_id":    raw["candidate_id"],
-        "name":            raw["name"],
-        "cv_path":         raw["cv_path"],
-        "best_score":      raw["best_score"],
-        "best_chunk_text": raw["best_chunk_text"],
-        "filter_flags":    raw.get("filter_flags", []),
-        "metadata": {
+    meta = raw.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {
             "experience_years": raw.get("experience_years"),
             "location":         raw.get("location"),
             "location_raw":     raw.get("location_raw"),
             "skills":           raw.get("skills", []),
             "email":            raw.get("email"),
-        },
+        }
+    return {
+        "candidate_id":    raw.get("candidate_id", ""),
+        "name":            raw.get("name", "Candidate"),
+        "cv_path":         raw.get("cv_path", ""),
+        "best_score":      raw.get("best_score", 0.8),
+        "best_chunk_text": raw.get("best_chunk_text", ""),
+        "filter_flags":    raw.get("filter_flags", []),
+        "metadata":        meta,
     }
