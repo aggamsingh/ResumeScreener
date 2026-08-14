@@ -181,9 +181,21 @@ async def lifespan(app: FastAPI):
     logger.info("Resume Screener API — Starting up")
     logger.info("=" * 55)
 
-    # Load embedding model (baked into Docker image, loads from disk cache ~1s)
+    # Load embedding model with single thread memory constraint (<120MB RAM)
+    try:
+        import torch  # type: ignore
+        import gc
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
     logger.info("Loading embedding model: %s", settings.embedding_model)
     app.state.model = SentenceTransformer(settings.embedding_model)
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
     logger.info("Embedding model ready")
 
     # Initialize Qdrant client
