@@ -1,6 +1,6 @@
 # CPU-only PyTorch index for lightweight Render deployment (<200MB RAM)
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.9.0+cpu
+torch==2.9.0+cpu
 
 # Core API
 fastapi~=0.111.0
