@@ -510,31 +510,45 @@ async def list_all_candidates(
 ):
     all_candidates = []
 
-    # 1. Try PostgreSQL database
+    # 1. Try Live Mabicons SharePoint REST API if credentials are provided
     try:
-        import psycopg2  # type: ignore
-        pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
-        conn = psycopg2.connect(pg_url)
-        cur = conn.cursor()
-        cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url, email, phone FROM resumes')
-        rows = cur.fetchall()
-        conn.close()
-        for r in rows:
-            all_candidates.append({
-                "candidate_id": str(r[0]),
-                "name": r[1] or "Candidate Profile",
-                "skills": r[2] if isinstance(r[2], list) else ([s.strip() for s in str(r[2]).split(",")] if r[2] else []),
-                "years_experience": r[3] or 0,
-                "current_role": r[4] or "",
-                "location": r[5] or "N/A",
-                "resume_text": r[6] or "",
-                "cv_path": r[7] or "",
-                "email": r[8] or "",
-                "phone": r[9] or "",
-                "best_score": 0.95
-            })
-    except Exception:
-        pass
+        from api.sharepoint_service import sharepoint_service
+        sp_cands = sharepoint_service.list_sharepoint_resumes(limit=limit)
+        if sp_cands:
+            all_candidates.extend(sp_cands)
+    except Exception as sp_err:
+        logger.warning("SharePoint live query skipped: %s", sp_err)
+
+    # 2. Try PostgreSQL database
+    if not all_candidates:
+        try:
+            import psycopg2  # type: ignore
+            pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+            conn = psycopg2.connect(pg_url)
+            cur = conn.cursor()
+            cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url, email, phone FROM resumes')
+            rows = cur.fetchall()
+            conn.close()
+            for r in rows:
+                all_candidates.append({
+                    "candidate_id": str(r[0]),
+                    "name": r[1] or "Candidate Profile",
+                    "skills": r[2] if isinstance(r[2], list) else ([s.strip() for s in str(r[2]).split(",")] if r[2] else []),
+                    "years_experience": r[3] or 0,
+                    "current_role": r[4] or "",
+                    "location": r[5] or "N/A",
+                    "resume_text": r[6] or "",
+                    "cv_path": r[7] or "",
+                    "source_file_url": r[7] or "",
+                    "email": r[8] or "",
+                    "phone": r[9] or "",
+                    "source": "Mabicons SharePoint",
+                    "sharepoint_site": "Mabicons SharePoint",
+                    "sharepoint_folder": "CV Database/Master CV/position wise",
+                    "best_score": 0.95
+                })
+        except Exception:
+            pass
 
     # 2. Fallback to canonical_candidates.json
     if not all_candidates:
