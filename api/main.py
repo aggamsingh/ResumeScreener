@@ -698,14 +698,33 @@ async def index_single_candidate(request: Request, body: CandidateIndexRequest):
     "/api/v1/screen",
     response_model=ScreeningResult,
     tags=["Screening"],
+    summary="Screen & rank candidates against a job description",
+)
+async def screen_resumes(
+    request: Request,
+    body: ScreeningRequest,
+    api_key: str = Security(api_key_header),
+):
+    """
+    Two-stage RAG pipeline:
+      1. Embeds JD, queries Qdrant for candidates, deduplicates, and filters.
+      2. Reranks candidates using LLM (Gemini or Groq) with structured scoring.
+    """
+    job_id = str(uuid.uuid4())
+    settings: Settings = request.app.state.settings
+    has_filters = body.filters is not None and body.filters.is_active()
 
-    has_filters = body.filters.is_active()
     logger.info(
-        "Screening request: top_k=%d, jd=%d chars, filters=%s",
-        top_k,
-        len(body.job_description),
-        body.filters.model_dump(exclude_none=True) if has_filters else "none",
+        "Screening request %s — top_k=%d, filters_active=%s",
+        job_id,
+        body.top_k,
+        has_filters,
     )
+    if has_filters:
+        logger.info(
+            "Filters: %s",
+            body.filters.model_dump(exclude_none=True) if has_filters else "none",
+        )
 
     # ── Step 1: Vector Retrieval + Hard Filtering ────────────────
     try:
