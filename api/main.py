@@ -503,11 +503,12 @@ async def health_check(request: Request):
 async def list_all_candidates(
     request: Request,
     limit: int = 200,
+    offset: int = 0,
     min_exp: Optional[int] = None,
     max_exp: Optional[int] = None,
     searchTerm: Optional[str] = None
 ):
-    candidates = []
+    all_candidates = []
 
     # 1. Try PostgreSQL database
     try:
@@ -515,56 +516,107 @@ async def list_all_candidates(
         pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
         conn = psycopg2.connect(pg_url)
         cur = conn.cursor()
-        cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes LIMIT %s', (limit,))
+        cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url, email, phone FROM resumes')
         rows = cur.fetchall()
         conn.close()
         for r in rows:
-            candidates.append({
+            all_candidates.append({
                 "candidate_id": str(r[0]),
                 "name": r[1] or "Candidate Profile",
                 "skills": r[2] if isinstance(r[2], list) else ([s.strip() for s in str(r[2]).split(",")] if r[2] else []),
                 "years_experience": r[3] or 0,
                 "current_role": r[4] or "",
                 "location": r[5] or "N/A",
-                "resume_text": (r[6] or "")[:1000],
+                "resume_text": r[6] or "",
                 "cv_path": r[7] or "",
+                "email": r[8] or "",
+                "phone": r[9] or "",
                 "best_score": 0.95
             })
     except Exception:
         pass
 
     # 2. Fallback to canonical_candidates.json
-    if not candidates:
+    if not all_candidates:
         json_path = Path(__file__).parent / "canonical_candidates.json"
         if json_path.exists():
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
                     json_cands = json.load(f)
-                for c in json_cands[:limit]:
+                for c in json_cands:
                     exp = c.get("years_experience", 0)
-                    if min_exp is not None and exp < min_exp:
-                        continue
-                    if max_exp is not None and exp > max_exp:
-                        continue
-                    candidates.append({
+                    all_candidates.append({
                         "candidate_id": str(c.get("id")),
                         "name": c.get("full_name") or "Candidate Profile",
                         "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
                         "years_experience": exp,
                         "current_role": c.get("current_role") or "",
                         "location": c.get("location") or "N/A",
-                        "resume_text": (c.get("resume_text") or "")[:1000],
+                        "resume_text": c.get("resume_text") or "",
                         "cv_path": c.get("source_file_url") or "",
+                        "email": c.get("email") or "",
+                        "phone": c.get("phone") or "",
                         "best_score": 0.95
                     })
             except Exception as j_err:
                 logger.warning("Error reading canonical_candidates.json: %s", j_err)
 
-    if searchTerm:
-        st = searchTerm.lower()
-        candidates = [c for c in candidates if st in c["name"].lower() or st in c["current_role"].lower() or any(st in s.lower() for s in c["skills"])]
+    # Filter
+    filtered = []
+    for c in all_candidates:
+        exp = c.get("years_experience", 0)
+        if min_exp is not None and exp < min_exp:
+            continue
+        if max_exp is not None and exp > max_exp:
+            continue
+        if searchTerm:
+            st = searchTerm.lower()
+            if not (st in c["name"].lower() or st in c["current_role"].lower() or any(st in s.lower() for s in c["skills"])):
+                continue
+        filtered.append(c)
 
-    return {"candidates": candidates, "total": len(candidates)}
+    paged = filtered[offset : offset + limit] if limit > 0 else filtered
+
+    # Truncate heavy resume_text for list view
+    for c in paged:
+        c["best_chunk_text"] = (c.get("resume_text") or "")[:500]
+        c["resume_text"] = (c.get("resume_text") or "")[:800]
+
+    return {"candidates": paged, "total": len(filtered)}
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}",
+    tags=["Candidates"],
+    summary="Get single candidate detail profile by ID",
+)
+async def get_candidate_by_id(candidate_id: str):
+    json_path = Path(__file__).parent / "canonical_candidates.json"
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                json_cands = json.load(f)
+            for c in json_cands:
+                if str(c.get("id")) == str(candidate_id) or c.get("full_name") == candidate_id:
+                    return {
+                        "id": str(c.get("id")),
+                        "candidate_id": str(c.get("id")),
+                        "full_name": c.get("full_name") or "Candidate Profile",
+                        "name": c.get("full_name") or "Candidate Profile",
+                        "email": c.get("email") or "",
+                        "phone": c.get("phone") or "",
+                        "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
+                        "years_experience": c.get("years_experience", 0),
+                        "current_role": c.get("current_role") or "",
+                        "location": c.get("location") or "N/A",
+                        "resume_text": c.get("resume_text") or "",
+                        "source_file_url": c.get("source_file_url") or "",
+                        "cv_path": c.get("source_file_url") or ""
+                    }
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=404, detail="Candidate profile not found")
 
 
 @app.post(
