@@ -554,8 +554,12 @@ async def list_all_candidates(
                         "location": c.get("location") or "N/A",
                         "resume_text": c.get("resume_text") or "",
                         "cv_path": c.get("source_file_url") or "",
+                        "source_file_url": c.get("source_file_url") or "",
                         "email": c.get("email") or "",
                         "phone": c.get("phone") or "",
+                        "source": c.get("source") or "Mabicons SharePoint",
+                        "sharepoint_site": c.get("sharepoint_site") or "Mabicons SharePoint",
+                        "sharepoint_folder": c.get("sharepoint_folder") or "CV Database/Master CV/position wise",
                         "best_score": 0.95
                     })
             except Exception as j_err:
@@ -611,7 +615,10 @@ async def get_candidate_by_id(candidate_id: str):
                         "location": c.get("location") or "N/A",
                         "resume_text": c.get("resume_text") or "",
                         "source_file_url": c.get("source_file_url") or "",
-                        "cv_path": c.get("source_file_url") or ""
+                        "cv_path": c.get("source_file_url") or "",
+                        "source": c.get("source") or "Mabicons SharePoint",
+                        "sharepoint_site": c.get("sharepoint_site") or "Mabicons SharePoint",
+                        "sharepoint_folder": c.get("sharepoint_folder") or "CV Database/Master CV/position wise",
                     }
         except Exception:
             pass
