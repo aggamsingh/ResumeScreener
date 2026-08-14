@@ -696,7 +696,7 @@ async def index_single_candidate(request: Request, body: CandidateIndexRequest):
 
 @app.post(
     "/api/v1/screen",
-    response_model=ScreeningResult,
+    response_model=ScreeningResponse,
     tags=["Screening"],
     summary="Screen & rank candidates against a job description",
 )
