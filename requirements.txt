@@ -1,7 +1,6 @@
-# ──────────────────────────────────────────────────────────────
-# Resume Screener — Python Dependencies
-# torch (CPU-only) is installed before this file in the Dockerfile
-# ──────────────────────────────────────────────────────────────
+# CPU-only PyTorch index for lightweight Render deployment (<200MB RAM)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
 
 # Core API
 fastapi~=0.111.0
@@ -40,5 +39,5 @@ transformers~=4.44
 
 # HTTP utilities
 httpx~=0.27.0
-# api/sharepoint.py imports requests directly (Microsoft Graph calls)
 requests~=2.32
+psycopg2-binary~=2.9.9
