@@ -120,6 +120,50 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
+def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name: str):
+    json_path = Path(__file__).parent / "canonical_candidates.json"
+    if not json_path.exists():
+        logger.info("No canonical_candidates.json found at %s — skipping auto-seed.", json_path)
+        return
+    try:
+        count = qdrant_client.count(collection_name).count
+        if count > 0:
+            logger.info("Qdrant collection '%s' already has %d points.", collection_name, count)
+            return
+        
+        logger.info("Seeding canonical candidates from %s into Qdrant...", json_path.name)
+        with open(json_path, "r", encoding="utf-8") as f:
+            candidates = json.load(f)
+
+        from qdrant_client.models import PointStruct
+        points = []
+        for idx, c in enumerate(candidates):
+            cand_id = c.get("id") or str(idx + 1)
+            text_to_embed = f"{c.get('full_name')} {c.get('current_role')} {' '.join(c.get('skills', []))} {c.get('resume_text')}"
+            vector = model.encode(text_to_embed).tolist()
+            payload = {
+                "candidate_id": cand_id,
+                "name": c.get("full_name"),
+                "email": c.get("email"),
+                "phone": c.get("phone"),
+                "skills": c.get("skills", []),
+                "years_experience": c.get("years_experience", 0),
+                "current_role": c.get("current_role", ""),
+                "location": c.get("location", ""),
+                "resume_text": c.get("resume_text", ""),
+                "source_file_url": c.get("source_file_url", ""),
+                "cv_path": c.get("source_file_url", ""),
+                "best_chunk_text": (c.get("resume_text") or "")[:500]
+            }
+            points.append(PointStruct(id=idx + 1, vector=vector, payload=payload))
+
+        if points:
+            qdrant_client.upsert(collection_name=collection_name, points=points)
+            logger.info("Successfully seeded %d canonical candidates into Qdrant vector database!", len(points))
+    except Exception as err:
+        logger.warning("Auto-seeding canonical candidates failed: %s", err)
+
+
 # ── App Lifecycle ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -156,8 +200,9 @@ async def lifespan(app: FastAPI):
         from indexer.embedder import ensure_collection
         vector_dim = app.state.model.get_sentence_embedding_dimension()
         ensure_collection(app.state.qdrant, settings.qdrant_collection, vector_dim)
+        seed_canonical_candidates_into_qdrant(app.state.qdrant, app.state.model, settings.qdrant_collection)
     except Exception as exc:
-        logger.warning("Could not auto-create collection '%s': %s", settings.qdrant_collection, exc)
+        logger.warning("Could not auto-create/seed collection '%s': %s", settings.qdrant_collection, exc)
 
     logger.info("API is ready to serve requests")
     logger.info("=" * 55)
@@ -811,7 +856,37 @@ Assistant:"""
                         if len(candidates) >= requested_count:
                             break
             except Exception as pg_err:
-                logger.warning("PostgreSQL chat fallback error: %s", pg_err)
+                logger.warning("PostgreSQL chat fallback failed (%s). Falling back to canonical_candidates.json", pg_err)
+                try:
+                    json_path = Path(__file__).parent / "canonical_candidates.json"
+                    if json_path.exists():
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            json_cands = json.load(f)
+                        existing_ids = {str(c.get("candidate_id")) for c in candidates}
+                        for c in json_cands:
+                            cid = str(c.get("id"))
+                            if cid not in existing_ids:
+                                exp = c.get("years_experience", 0)
+                                if min_exp is not None and exp < min_exp:
+                                    continue
+                                if max_exp is not None and exp > max_exp:
+                                    continue
+                                candidates.append({
+                                    "candidate_id": cid,
+                                    "name": c.get("full_name"),
+                                    "metadata": {
+                                        "experience_years": exp,
+                                        "location": c.get("location") or "N/A",
+                                        "skills": c.get("skills") or []
+                                    },
+                                    "best_chunk_text": (c.get("resume_text") or "")[:800],
+                                    "cv_path": c.get("source_file_url")
+                                })
+                                existing_ids.add(cid)
+                                if len(candidates) >= requested_count:
+                                    break
+                except Exception as json_err:
+                    logger.warning("JSON fallback error: %s", json_err)
 
         candidates = candidates[:requested_count]
         candidates_context = ""
