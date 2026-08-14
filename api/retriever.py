@@ -264,12 +264,12 @@ def _deduplicate(hits: list, jd_text: str = "", filters: Optional[ScreeningFilte
         if cid not in best or score > best[cid]["best_score"]:
             best[cid] = {
                 "candidate_id":    cid,
-                "name":            payload.get("name", "Unknown"),
-                "cv_path":         payload.get("cv_path", ""),
+                "name":            payload.get("name") or payload.get("full_name") or "Unknown",
+                "cv_path":         payload.get("cv_path") or payload.get("source_file_url") or "",
                 "best_score":      score,
-                "best_chunk_text": payload.get("chunk_text", ""),
+                "best_chunk_text": payload.get("chunk_text") or payload.get("best_chunk_text") or payload.get("resume_text") or "",
                 # Metadata for filtering
-                "experience_years": payload.get("experience_years"),
+                "experience_years": payload.get("experience_years") if payload.get("experience_years") is not None else payload.get("years_experience"),
                 "location":         payload.get("location"),
                 "location_raw":     payload.get("location_raw"),
                 "skills":           payload.get("skills", []),

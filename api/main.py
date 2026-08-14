@@ -477,6 +477,78 @@ async def health_check(request: Request):
     )
 
 
+@app.get(
+    "/api/v1/candidates",
+    tags=["Candidates"],
+    summary="Get candidate list for Dashboard, Resume Bank, and Search Candidate pages",
+)
+async def list_all_candidates(
+    request: Request,
+    limit: int = 200,
+    min_exp: Optional[int] = None,
+    max_exp: Optional[int] = None,
+    searchTerm: Optional[str] = None
+):
+    candidates = []
+
+    # 1. Try PostgreSQL database
+    try:
+        import psycopg2  # type: ignore
+        pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
+        conn = psycopg2.connect(pg_url)
+        cur = conn.cursor()
+        cur.execute('SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes LIMIT %s', (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        for r in rows:
+            candidates.append({
+                "candidate_id": str(r[0]),
+                "name": r[1] or "Candidate Profile",
+                "skills": r[2] if isinstance(r[2], list) else ([s.strip() for s in str(r[2]).split(",")] if r[2] else []),
+                "years_experience": r[3] or 0,
+                "current_role": r[4] or "",
+                "location": r[5] or "N/A",
+                "resume_text": (r[6] or "")[:1000],
+                "cv_path": r[7] or "",
+                "best_score": 0.95
+            })
+    except Exception:
+        pass
+
+    # 2. Fallback to canonical_candidates.json
+    if not candidates:
+        json_path = Path(__file__).parent / "canonical_candidates.json"
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    json_cands = json.load(f)
+                for c in json_cands[:limit]:
+                    exp = c.get("years_experience", 0)
+                    if min_exp is not None and exp < min_exp:
+                        continue
+                    if max_exp is not None and exp > max_exp:
+                        continue
+                    candidates.append({
+                        "candidate_id": str(c.get("id")),
+                        "name": c.get("full_name") or "Candidate Profile",
+                        "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
+                        "years_experience": exp,
+                        "current_role": c.get("current_role") or "",
+                        "location": c.get("location") or "N/A",
+                        "resume_text": (c.get("resume_text") or "")[:1000],
+                        "cv_path": c.get("source_file_url") or "",
+                        "best_score": 0.95
+                    })
+            except Exception as j_err:
+                logger.warning("Error reading canonical_candidates.json: %s", j_err)
+
+    if searchTerm:
+        st = searchTerm.lower()
+        candidates = [c for c in candidates if st in c["name"].lower() or st in c["current_role"].lower() or any(st in s.lower() for s in c["skills"])]
+
+    return {"candidates": candidates, "total": len(candidates)}
+
+
 @app.post(
     "/api/v1/index-candidate",
     tags=["Indexing"],
