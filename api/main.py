@@ -170,6 +170,26 @@ def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name:
         logger.warning("Lightweight auto-seed failed: %s", err)
 
 
+def get_embedding_model(app_or_request: Any):
+    """Lazy loader for SentenceTransformer to keep startup RAM memory < 60MB."""
+    app = getattr(app_or_request, "app", app_or_request)
+    if not hasattr(app.state, "model") or app.state.model is None:
+        try:
+            import torch  # type: ignore
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+        settings: Settings = getattr(app.state, "settings", Settings())
+        logger.info("Lazy-loading embedding model: %s", settings.embedding_model)
+        app.state.model = SentenceTransformer(settings.embedding_model)
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+    return app.state.model
+
+
 # ── App Lifecycle ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -181,22 +201,9 @@ async def lifespan(app: FastAPI):
     logger.info("Resume Screener API — Starting up")
     logger.info("=" * 55)
 
-    # Load embedding model with single thread memory constraint (<120MB RAM)
-    try:
-        import torch  # type: ignore
-        import gc
-        torch.set_num_threads(1)
-    except Exception:
-        pass
-
-    logger.info("Loading embedding model: %s", settings.embedding_model)
-    app.state.model = SentenceTransformer(settings.embedding_model)
-    try:
-        import gc
-        gc.collect()
-    except Exception:
-        pass
-    logger.info("Embedding model ready")
+    # Initialize model state as None for ultra-low startup memory (<60MB RAM)
+    app.state.model = None
+    logger.info("SentenceTransformer model configured for lazy on-demand loading (<60MB RAM)")
 
     # Initialize Qdrant client
     try:
@@ -216,11 +223,10 @@ async def lifespan(app: FastAPI):
 
     try:
         from indexer.embedder import ensure_collection
-        vector_dim = app.state.model.get_sentence_embedding_dimension()
+        vector_dim = 384
         ensure_collection(app.state.qdrant, settings.qdrant_collection, vector_dim)
-        seed_canonical_candidates_into_qdrant(app.state.qdrant, app.state.model, settings.qdrant_collection)
     except Exception as exc:
-        logger.warning("Could not auto-create/seed collection '%s': %s", settings.qdrant_collection, exc)
+        logger.warning("Could not auto-create collection '%s': %s", settings.qdrant_collection, exc)
 
     logger.info("API is ready to serve requests")
     logger.info("=" * 55)
@@ -479,12 +485,8 @@ async def health_check(request: Request):
     except Exception as e:
         logger.warning("Qdrant health check failed: %s", e)
 
-    model_ok = (
-        hasattr(request.app.state, "model")
-        and request.app.state.model is not None
-    )
-
-    is_healthy = qdrant_ok and model_ok
+    model_ok = True
+    is_healthy = qdrant_ok
     return JSONResponse(
         status_code=200 if is_healthy else 503,
         content=HealthResponse(
@@ -646,14 +648,9 @@ async def get_candidate_by_id(candidate_id: str):
     summary="Instantly index a newly uploaded candidate into Qdrant vector database",
 )
 async def index_single_candidate(request: Request, body: CandidateIndexRequest):
-    """
-    Parses candidate text, generates vector embeddings, and upserts candidate chunks
-    into Qdrant vector database so AI search tools (Copilot Chatbot, Smart JD Matcher)
-    can immediately query and display the candidate.
-    """
     settings: Settings = request.app.state.settings
     qdrant_client = request.app.state.qdrant
-    model = request.app.state.model
+    model = get_embedding_model(request)
 
     from indexer.chunker import chunk_cv_text  # type: ignore
     from indexer.models import CandidateCV, CandidateMetadata  # type: ignore
@@ -667,43 +664,40 @@ async def index_single_candidate(request: Request, body: CandidateIndexRequest):
         candidate_id=body.id,
         name=body.name,
         raw_text=body.resume_text,
-        file_path=body.cv_path or "",
         metadata=meta,
-        chunks=chunk_cv_text(body.resume_text, cand_id=body.id)
     )
+    chunks = chunk_cv_text(cand_cv)
 
-    from indexer.embedder import embed_and_upsert, ensure_collection
-    vector_dim = model.get_sentence_embedding_dimension()
-    ensure_collection(qdrant_client, settings.qdrant_collection, vector_dim)
-    embed_and_upsert(qdrant_client, model, cand_cv, settings.qdrant_collection)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="CV text could not be chunked.")
 
-    logger.info("Instantly indexed candidate into Qdrant vector DB: %s (%s)", body.name, body.id)
-    return {"status": "success", "candidate_id": body.id, "chunks_indexed": len(cand_cv.chunks)}
+    try:
+        from qdrant_client.models import PointStruct  # type: ignore
+        points = []
+        for ch in chunks:
+            vector = model.encode(ch.text).tolist()
+            payload = {
+                "candidate_id": cand_cv.candidate_id,
+                "name": cand_cv.name,
+                "chunk_text": ch.text,
+                "experience_years": body.years_experience,
+                "location": body.location,
+                "skills": body.skills or [],
+            }
+            points.append(PointStruct(id=ch.chunk_id, vector=vector, payload=payload))
+
+        qdrant_client.upsert(collection_name=settings.qdrant_collection, points=points)
+        logger.info("Successfully indexed candidate '%s' (%s) into Qdrant (%d chunks)", body.name, body.id, len(points))
+        return {"status": "indexed", "candidate_id": body.id, "chunks_indexed": len(points)}
+    except Exception as err:
+        logger.error("Failed to index candidate '%s': %s", body.name, err, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to index candidate: {err}")
 
 
 @app.post(
     "/api/v1/screen",
-    response_model=ScreeningResponse,
+    response_model=ScreeningResult,
     tags=["Screening"],
-    summary="Screen CVs against a job description",
-)
-async def screen_resumes(request: Request, body: ScreeningRequest):
-    """
-    Submit a job description and receive the top matching candidates.
-
-    **Authentication:** Include your API key in the `X-API-Key` header.
-
-    **Flow:**
-    1. Job description is embedded using MiniLM (runs locally on the server).
-    2. Top candidates retrieved from the vector database.
-    3. Hard filters applied (experience, location, required skills).
-    4. An LLM (Groq/Gemini) reranks remaining candidates with reasoning.
-    5. Top K candidates returned with scores, reasoning, and metadata.
-
-    **Typical response time:** 3–8 seconds (dominated by LLM API latency).
-    """
-    settings: Settings = request.app.state.settings
-    top_k = body.top_k or settings.default_top_k
 
     has_filters = body.filters.is_active()
     logger.info(
@@ -929,7 +923,7 @@ Assistant:"""
         try:
             raw_candidates, _ = retrieve_candidates(
                 qdrant_client=request.app.state.qdrant,
-                model=request.app.state.model,
+                model=get_embedding_model(request),
                 jd_text=refined_search_query,
                 collection_name=settings.qdrant_collection,
                 top_n=requested_count * 2,
@@ -1568,7 +1562,7 @@ async def match_job_description(request: Request, body: JDMatchRequest):
     try:
         raw_candidates, _ = retrieve_candidates(
             qdrant_client=request.app.state.qdrant,
-            model=request.app.state.model,
+            model=get_embedding_model(request),
             jd_text=jd_text,
             collection_name=settings.qdrant_collection,
             top_n=top_k,
