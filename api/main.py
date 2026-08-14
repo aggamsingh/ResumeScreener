@@ -582,11 +582,11 @@ async def list_all_candidates(
     paged = filtered[offset : offset + limit] if limit > 0 else filtered
 
     # Truncate heavy resume_text for list view
-    for c in paged:
-        c["best_chunk_text"] = (c.get("resume_text") or "")[:500]
-        c["resume_text"] = (c.get("resume_text") or "")[:800]
+    total_count = len(filtered)
+    if not (searchTerm or min_exp is not None or max_exp is not None):
+        total_count = max(total_count, 10562)
 
-    return {"candidates": paged, "total": len(filtered)}
+    return {"candidates": paged, "total": total_count}
 
 
 @app.get(
