@@ -314,7 +314,7 @@ async def reindex_canonical(request: Request):
 
 # Prefix-match so /docs, /docs/, and Swagger asset sub-paths all pass through.
 # FastAPI redirects /docs → /docs/ internally; exact-match blocked the redirect target.
-_PUBLIC_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/api/v1/cvs")
+_PUBLIC_PREFIXES = ("/", "/health", "/docs", "/redoc", "/openapi.json", "/api/v1/cvs")
 
 
 @app.middleware("http")
