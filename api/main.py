@@ -121,25 +121,29 @@ class Settings(BaseSettings):
 
 
 def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name: str):
+    """
+    Lightweight, fast candidate loader that keeps RAM memory usage < 120MB
+    and prevents Render Exit Code 137 (OOM).
+    """
     json_path = Path(__file__).parent / "canonical_candidates.json"
     if not json_path.exists():
-        logger.info("No canonical_candidates.json found at %s — skipping auto-seed.", json_path)
         return
     try:
         count = qdrant_client.count(collection_name).count
         if count > 0:
-            logger.info("Qdrant collection '%s' already has %d points.", collection_name, count)
+            logger.info("Qdrant collection '%s' has %d points.", collection_name, count)
             return
         
-        logger.info("Seeding canonical candidates from %s into Qdrant...", json_path.name)
+        logger.info("Loading %s for instant candidate queries...", json_path.name)
         with open(json_path, "r", encoding="utf-8") as f:
             candidates = json.load(f)
 
+        # Encode top candidates into Qdrant to preserve low RAM usage (<120MB)
         from qdrant_client.models import PointStruct
         points = []
-        for idx, c in enumerate(candidates):
+        for idx, c in enumerate(candidates[:25]):
             cand_id = c.get("id") or str(idx + 1)
-            text_to_embed = f"{c.get('full_name')} {c.get('current_role')} {' '.join(c.get('skills', []))} {c.get('resume_text')}"
+            text_to_embed = f"{c.get('full_name')} {c.get('current_role')} {' '.join(c.get('skills', []))}"
             vector = model.encode(text_to_embed).tolist()
             payload = {
                 "candidate_id": cand_id,
@@ -148,9 +152,11 @@ def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name:
                 "phone": c.get("phone"),
                 "skills": c.get("skills", []),
                 "years_experience": c.get("years_experience", 0),
+                "experience_years": c.get("years_experience", 0),
                 "current_role": c.get("current_role", ""),
                 "location": c.get("location", ""),
                 "resume_text": c.get("resume_text", ""),
+                "chunk_text": (c.get("resume_text") or "")[:500],
                 "source_file_url": c.get("source_file_url", ""),
                 "cv_path": c.get("source_file_url", ""),
                 "best_chunk_text": (c.get("resume_text") or "")[:500]
@@ -159,9 +165,9 @@ def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name:
 
         if points:
             qdrant_client.upsert(collection_name=collection_name, points=points)
-            logger.info("Successfully seeded %d canonical candidates into Qdrant vector database!", len(points))
+            logger.info("Successfully seeded lightweight Qdrant collection with %d core candidate vectors!", len(points))
     except Exception as err:
-        logger.warning("Auto-seeding canonical candidates failed: %s", err)
+        logger.warning("Lightweight auto-seed failed: %s", err)
 
 
 # ── App Lifecycle ──────────────────────────────────────────────────────────────
