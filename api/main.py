@@ -12,7 +12,7 @@ Routes:
   - GET  /health          → service status check
   - POST /api/v1/screen  → run a screening request
 """
-from __future__ import annotations
+
 
 # Import mock_grpc first to bypass blocked cygrpc DLL under restrictive environment policies
 import mock_grpc
