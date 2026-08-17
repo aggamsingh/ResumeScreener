@@ -141,11 +141,19 @@ class MabiconsSharePointService:
                     item_name = best_item.get("name", "")
                     is_docx = item_name.lower().endswith((".docx", ".doc"))
                     
-                    content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
                     if is_docx:
-                        content_url += "?format=pdf"
-                        
-                    content_res = requests.get(content_url, headers=headers, timeout=15)
+                        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content?format=pdf"
+                        content_res = requests.get(content_url, headers=headers, timeout=15)
+                    else:
+                        item_detail_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}"
+                        detail_res = requests.get(item_detail_url, headers=headers, timeout=10)
+                        download_url = detail_res.json().get("@microsoft.graph.downloadUrl") if detail_res.ok else None
+                        if download_url:
+                            content_res = requests.get(download_url, headers=headers, timeout=15)
+                        else:
+                            content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+                            content_res = requests.get(content_url, headers=headers, timeout=15)
+
                     if content_res.ok and content_res.content.startswith(b"%PDF"):
                         logger.info("Successfully streamed original candidate resume binary (%d bytes) from SharePoint for '%s'", len(content_res.content), item_name)
                         return content_res.content
