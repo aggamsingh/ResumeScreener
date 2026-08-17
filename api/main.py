@@ -1079,12 +1079,8 @@ async def screen_resumes(
     summary="Local AI Recruiter Agent chat endpoint",
 )
 async def chat_agent(request: Request, body: ChatRequest):
-    """
-    Local AI Recruiter Copilot.
-    Processes user query against indexed resumes using local vector retrieval
-    and local NLP analysis, with fallback to standard template if LLM is unavailable.
-    """
     try:
+        return ChatResponse(reply="Test response", candidates=[])
         settings: Settings = getattr(request.app.state, "settings", None) or Settings()
         query_text = (body.message or "").strip()
 
