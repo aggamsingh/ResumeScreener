@@ -1066,7 +1066,7 @@ async def chat_agent(request: Request, body: ChatRequest):
     and local NLP analysis, with fallback to standard template if LLM is unavailable.
     """
     try:
-        settings: Settings = request.app.state.settings
+        settings: Settings = getattr(request.app.state, "settings", None) or Settings()
         query_text = body.message.strip()
 
         # 1. Parse ONLY user messages from history and current query
