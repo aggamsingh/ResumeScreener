@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT = "060dddc8-aa4a-44e7-ae6a-048a4865f3df"
 DEFAULT_CLIENT = "a55dc241-90f6-43cb-afae-cf72891b5000"
-DEFAULT_SECRET = base64.b64decode("UEdoOFF+aFZBQTYubUtaMnAxVWNUTS0tQVFDcnJVTi53ZFhHaGNXcA==").decode()
+DEFAULT_SECRET = base64.b64decode("UEdoOFF+aFZBQTYubUtaMnAxVWNUbS0tQVFDcnJVTi53ZFhHaGNXcA==").decode()
 
 class MabiconsSharePointService:
     def __init__(self):
