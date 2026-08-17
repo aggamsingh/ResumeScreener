@@ -26,26 +26,28 @@ class MabiconsSharePointService:
     def get_token(self) -> Optional[str]:
         if self.access_token:
             return self.access_token
-        
-        if not (self.tenant_id and self.client_id and self.client_secret):
-            logger.info("SharePoint Graph credentials not fully set; using public Web REST mode.")
-            return None
 
         token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "scope": "https://graph.microsoft.com/.default"
-        }
-        try:
-            res = requests.post(token_url, data=payload, timeout=10)
-            if res.ok:
-                self.access_token = res.json().get("access_token")
-                logger.info("Successfully acquired Microsoft Graph API access token for Mabicons SharePoint")
-                return self.access_token
-        except Exception as e:
-            logger.warning("Error fetching SharePoint Graph OAuth token: %s", e)
+
+        for secret_to_try in [self.client_secret, DEFAULT_SECRET]:
+            if not secret_to_try:
+                continue
+            payload = {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": secret_to_try,
+                "scope": "https://graph.microsoft.com/.default"
+            }
+            try:
+                res = requests.post(token_url, data=payload, timeout=10)
+                if res.ok:
+                    self.access_token = res.json().get("access_token")
+                    logger.info("Successfully acquired Microsoft Graph API access token for Mabicons SharePoint")
+                    return self.access_token
+                else:
+                    logger.warning("OAuth token request failed with status %d: %s", res.status_code, res.text[:150])
+            except Exception as e:
+                logger.warning("Error fetching SharePoint Graph OAuth token: %s", e)
         return None
 
     def list_sharepoint_resumes(self, folder_path: str = "Master CV/position wise", limit: int = 100) -> List[Dict[str, Any]]:
