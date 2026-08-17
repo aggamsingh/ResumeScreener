@@ -173,14 +173,23 @@ def seed_canonical_candidates_into_qdrant(qdrant_client, model, collection_name:
         logger.warning("Lightweight auto-seed failed: %s", err)
 
 
-_CANONICAL_CANDIDATES = []
-try:
-    _json_p = Path(__file__).parent / "canonical_candidates.json"
-    if _json_p.exists():
-        with open(_json_p, "r", encoding="utf-8") as _f:
-            _CANONICAL_CANDIDATES = json.load(_f)
-except Exception as _e:
-    logger.warning("Failed to pre-load canonical candidates: %s", _e)
+_CANONICAL_CANDIDATES_CACHE = None
+
+def get_canonical_candidates() -> list[dict]:
+    global _CANONICAL_CANDIDATES_CACHE
+    if _CANONICAL_CANDIDATES_CACHE is not None:
+        return _CANONICAL_CANDIDATES_CACHE
+    try:
+        json_p = Path(__file__).parent / "canonical_candidates.json"
+        if json_p.exists():
+            with open(json_p, "r", encoding="utf-8") as f:
+                _CANONICAL_CANDIDATES_CACHE = json.load(f)
+        else:
+            _CANONICAL_CANDIDATES_CACHE = []
+    except Exception as e:
+        logger.warning("Failed to load canonical candidates: %s", e)
+        _CANONICAL_CANDIDATES_CACHE = []
+    return _CANONICAL_CANDIDATES_CACHE
 
 
 def get_embedding_model(app_or_request: Any):
@@ -1246,7 +1255,7 @@ Assistant:"""
 
         candidates = []
         try:
-            json_cands = _CANONICAL_CANDIDATES or []
+            json_cands = get_canonical_candidates()
             for c in json_cands:
                 exp = c.get("years_experience", 0) or 0
                 if min_exp is not None and exp < min_exp:
