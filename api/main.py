@@ -845,6 +845,14 @@ async def stream_candidate_pdf(candidate_id: str):
         logger.warning("SharePoint raw binary fetch failed for %s: %s", candidate_id, e)
 
     # 2. Dynamic Fallback PDF stream
+    sp_debug = "No raw bytes returned"
+    try:
+        from api.sharepoint_service import sharepoint_service
+        tok = sharepoint_service.get_token()
+        sp_debug = f"Tok acquired: {bool(tok)}, cand: {cand_info.get('full_name')}"
+    except Exception as err:
+        sp_debug = f"Err: {err}"
+
     pdf_bytes = generate_pdf_stream(
         name=cand_info.get("full_name") or cand_info.get("name"),
         role=cand_info.get("current_role"),
@@ -853,7 +861,11 @@ async def stream_candidate_pdf(candidate_id: str):
         skills=cand_info.get("skills"),
         resume_text=cand_info.get("resume_text", "")
     )
-    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=resume.pdf", "X-SharePoint-Debug": sp_debug}
+    )
 
 
 @app.get(
