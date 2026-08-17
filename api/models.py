@@ -229,7 +229,7 @@ class ChatHistoryItem(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(default="", description="User prompt / question")
-    history: Optional[list[Any]] = Field(default=[], description="Previous chat messages")
+    history: Optional[list[Any]] = Field(default_factory=list, description="Previous chat messages")
 
 
 class ChatResponse(BaseModel):
