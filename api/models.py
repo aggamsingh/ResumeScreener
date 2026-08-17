@@ -1,7 +1,7 @@
 """
 Pydantic models for request validation and response serialization.
 """
-from __future__ import annotations
+
 
 import uuid
 from datetime import datetime, timezone
