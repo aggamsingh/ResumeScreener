@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Security
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 from pydantic import Field
