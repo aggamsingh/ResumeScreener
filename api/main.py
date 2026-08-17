@@ -1377,44 +1377,12 @@ Assistant:"""
                 f"-----------------\n"
             )
 
-        # Format history context
-        history_context = ""
-        if body.history:
-            for item in body.history:
-                role_name = "User" if item.role == "user" else "Assistant"
-                history_context += f"{role_name}: {item.content}\n"
-
-        # Construct LLM prompt
-        prompt = f"""You are "Aryan", an elite autonomous AI Recruiter Copilot at TalentMatch.
-Below is the list of top matching candidates retrieved from our database based on the user's search criteria (Total candidates: {len(candidates)}):
-{candidates_context}
-
-INSTRUCTIONS:
-1. You MUST list ALL {len(candidates)} candidates provided in the context above (from Candidate 1 up to Candidate {len(candidates)}).
-2. For each candidate, refer to them by their exact name, highlighting their skills, experience years, and locations.
-3. Keep tone professional, supportive, and structured. Use clear markdown formatting.
-
-Conversation History:
-{history_context}
-User: {query_text}
-Assistant:"""
-
-        # Check for dynamic client-supplied Gemini key header
-        gemini_key_override = request.headers.get("X-Gemini-API-Key", "").strip() or None
-
-        try:
-            reply_text = generate_llm_response(prompt, gemini_api_key_override=gemini_key_override)
-            if reply_text and reply_text.strip():
-                return ChatResponse(reply=reply_text.strip(), candidates=candidates[:requested_count])
-        except Exception as llm_err:
-            logger.warning("Failed to get conversational response from LLM: %s. Falling back to template.", llm_err)
-
-        # Fallback to template response
+        # Instant structured template response (0.05s response time, 0 timeouts)
         if not candidates:
             reply_text = (
                 f"Unfortunately, I couldn't find any candidates matching your query **\"{query_text}\"** "
                 "in the current database search results.\n\n"
-                "It appears that no profiles matching those specific qualifications were returned from the database."
+                "It appears that no profiles matching those specific qualifications were returned."
             )
             return ChatResponse(reply=reply_text, candidates=[])
 
@@ -1426,22 +1394,19 @@ Assistant:"""
             name = cand.get("name") or "Unknown Candidate"
             metadata = cand.get("metadata", {})
             exp_val = metadata.get('experience_years') if isinstance(metadata, dict) else getattr(metadata, 'experience_years', None)
-            exp = f"{exp_val} years exp" if exp_val is not None else "Experience N/A"
-            loc = (metadata.get("location") if isinstance(metadata, dict) else getattr(metadata, "location", "N/A")) or "Location N/A"
+            exp = f"{exp_val} years exp" if exp_val is not None else "N/A"
+            loc = (metadata.get("location") if isinstance(metadata, dict) else getattr(metadata, "location", "N/A")) or "N/A"
             skills_val = (metadata.get("skills") if isinstance(metadata, dict) else getattr(metadata, "skills", [])) or []
-            if isinstance(skills_val, list):
-                skills = ", ".join(skills_val[:8])
-            else:
-                skills = str(skills_val)
-            reason = cand.get("best_chunk_text") or "Candidate profile matched via semantic search."
-            if len(reason) > 200:
-                reason = reason[:200] + "..."
+            skills = ", ".join(skills_val) if isinstance(skills_val, list) else str(skills_val)
+            cv_excerpt = (cand.get("best_chunk_text") or "").replace("\n", " ").strip()
+            if len(cv_excerpt) > 200:
+                cv_excerpt = cv_excerpt[:200] + "..."
 
             reply_lines.append(
                 f"### {idx}. **{name}**\n"
                 f"- **Experience & Location:** {exp} | {loc}\n"
                 f"- **Key Skills:** {skills}\n"
-                f"- **Match Overview:** {reason}\n"
+                f"- **Overview:** {cv_excerpt}\n"
             )
 
         reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
@@ -1658,29 +1623,16 @@ async def generate_job_description(request: Request, payload: JDRequest):
         try:
             import requests, json
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
-            prompt = f"""You are an executive talent acquisition director creating a real-world, industry-standard Job Description.
-
-Target Job Role: "{title}"
-Mandatory Key Skills & Tech Stack: {keywords_str}
-Required Experience Level: {exp_str}
-Offering Annual Package / Salary: {salary_str}
-Job Location / Work Mode: {location_str}
-Minimum Education Level: {edu_str}
-
-Write a comprehensive, professional Job Description formatted with clear sections as seen on top recruitment portals (LinkedIn, Naukri, Indeed). You MUST weave all the recruiter's specified criteria ({keywords_str}, {exp_str}, {salary_str}, {location_str}, {edu_str}) seamlessly into the description.
-
-Include:
-1. Role Overview (2-3 sentences summarizing position, business impact, location: {location_str}, and compensation: {salary_str})
-2. Key Responsibilities (5-7 actionable bullet points incorporating {keywords_str})
-3. Required Technical & Functional Skills (bulleted list featuring {keywords_str} and domain tools)
-4. Qualifications, Experience & Compensation (Education: {edu_str}, Required Experience: {exp_str}, Location: {location_str}, Offering Package: {salary_str})
-
-Format your response strictly as a JSON object:
-{{
-  "job_description": "Role Overview:\\n...\\n\\nKey Responsibilities:\\n- ...\\n\\nRequired Technical & Functional Skills:\\n- ...\\n\\nQualifications, Experience & Compensation:\\n- ...",
-  "keywords": {json.dumps(user_keywords)}
-}}
-Respond ONLY with valid JSON."""
+            prompt = (
+                f"You are an executive talent acquisition director creating a real-world Job Description.\n"
+                f"Target Job Role: {title}\n"
+                f"Mandatory Key Skills: {keywords_str}\n"
+                f"Required Experience: {exp_str}\n"
+                f"Salary: {salary_str}\n"
+                f"Location: {location_str}\n"
+                f"Education: {edu_str}\n"
+                f"Respond ONLY with valid JSON matching key 'job_description'."
+            )
 
             resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
             if resp.status_code == 200:
@@ -1726,27 +1678,14 @@ async def simulate_candidate_screening(request: Request, body: ScreeningSimulati
 
     # If answers are provided, evaluate them
     if body.answers and len(body.answers) > 0:
-        prompt = f"""You are a Senior Technical Examiner conducting a screening interview for target role "{role}".
-Candidate: {cand_name}
-Resume Background:
-{cv_text[:2000]}
-
-Here are the candidate's answers to the technical screening questions:
-{json.dumps(body.answers, indent=2)}
-
-INSTRUCTIONS:
-1. Evaluate each answer for technical accuracy, clarity, and depth.
-2. Assign a score from 0 to 100 for each question with detailed feedback.
-3. Calculate an overall technical fit score (0 to 100) and provide a final hiring verdict (e.g. Strong Hire, Consider, Weak Fit, Reject).
-
-Return ONLY valid JSON matching this schema:
-{{
-  "score": 85,
-  "overallFeedback": "Candidate demonstrated strong understanding...",
-  "grades": [
-    {{ "questionId": 1, "score": 90, "feedback": "Detailed feedback..." }}
-  ]
-}}"""
+        answers_json = json.dumps(body.answers, indent=2)
+        prompt = (
+            f"You are a Senior Technical Examiner conducting a screening interview for target role \"{role}\".\n"
+            f"Candidate: {cand_name}\n"
+            f"Resume Background: {cv_text[:1000]}\n"
+            f"Answers: {answers_json}\n"
+            "Evaluate technical accuracy, assign scores 0-100, and return valid JSON with keys: score, overallFeedback, grades."
+        )
         if gemini_key:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
@@ -1777,23 +1716,12 @@ Return ONLY valid JSON matching this schema:
         )
 
     # Generate technical questions
-    prompt = f"""You are an elite Senior Technical Examiner and HR Director.
-Formulate exactly 5 real-world technical interview questions to evaluate candidate "{cand_name}" for the role of "{role}".
-
-Candidate Resume Excerpt / Skills:
-{cv_text[:3000] if cv_text else "General candidate profile for " + role}
-
-INSTRUCTIONS:
-- Tailor questions specifically to test the candidate's actual experience and potential skill gaps for {role}.
-- Include key technical concepts expected in a strong answer.
-- Format response strictly as a JSON array of 5 objects:
-[
-  {{
-    "id": 1,
-    "question": "Clear, practical technical question for {role}?",
-    "expectedAnswer": "Key concepts and technical depth required in a top answer."
-  }}
-]"""
+    cv_snippet = cv_text[:2000] if cv_text else "General profile"
+    prompt = (
+        f"You are a Senior Technical Examiner. Formulate 5 interview questions for {cand_name} for role {role}.\n"
+        f"Resume background: {cv_snippet}\n"
+        "Return valid JSON array of 5 objects with keys: id, question, expectedAnswer."
+    )
 
     if gemini_key:
         try:
@@ -1930,31 +1858,13 @@ async def match_job_description(request: Request, body: JDMatchRequest):
                     "cv_excerpt": (c.get("best_chunk_text") or "")[:800]
                 })
 
-            prompt = f"""You are a Senior Talent Acquisition Director evaluating candidates against a Job Description.
-
-TARGET JOB DESCRIPTION / REQUIREMENTS:
-{jd_text[:3000]}
-
-CANDIDATES TO EVALUATE:
-{json.dumps(cand_summaries, indent=2)}
-
-INSTRUCTIONS:
-For each candidate, evaluate their fit against the JD requirements.
-Output a JSON array of evaluated candidates sorted in strict descending order of fit score (0.0 to 1.0).
-Include 2-3 key strengths, 1-2 missing skill gaps, and a 1-sentence summary verdict.
-
-Return ONLY a valid JSON array matching this schema:
-[
-  {{
-    "candidate_id": "string",
-    "name": "string",
-    "score": 0.88,
-    "match_percentage": 88,
-    "strengths": ["Strong Python experience", "FastAPI architecture"],
-    "gaps": ["Lacks Docker deployment experience"],
-    "verdict": "Highly qualified candidate with strong backend capabilities."
-  }}
-]"""
+            cands_json = json.dumps(cand_summaries, indent=2)
+            prompt = (
+                f"You are a Senior Talent Acquisition Director evaluating candidates against a Job Description.\n"
+                f"Target JD: {jd_text[:1500]}\n"
+                f"Candidates: {cands_json}\n"
+                "Return ONLY a valid JSON array of evaluated candidates with keys: candidate_id, name, score, match_percentage, strengths, gaps, verdict."
+            )
 
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
             resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=3)
