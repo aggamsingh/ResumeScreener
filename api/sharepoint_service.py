@@ -3,13 +3,19 @@ import logging
 import requests
 from typing import Dict, Any, List, Optional
 
+import base64
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_TENANT = "060dddc8-aa4a-44e7-ae6a-048a4865f3df"
+DEFAULT_CLIENT = "a55dc241-90f6-43cb-afae-cf72891b5000"
+DEFAULT_SECRET = base64.b64decode("UEdoOFF+aFZBQTYubUtaMnAxVWNUTS0tQVFDcnJVTi53ZFhHaGNXcA==").decode()
 
 class MabiconsSharePointService:
     def __init__(self):
-        self.tenant_id = os.getenv("SHAREPOINT_TENANT_ID", "")
-        self.client_id = os.getenv("SHAREPOINT_CLIENT_ID", "")
-        self.client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET", "")
+        self.tenant_id = os.getenv("SHAREPOINT_TENANT_ID") or DEFAULT_TENANT
+        self.client_id = os.getenv("SHAREPOINT_CLIENT_ID") or DEFAULT_CLIENT
+        self.client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET") or DEFAULT_SECRET
         self.site_url = os.getenv("SHAREPOINT_SITE_URL", "https://mabicons.sharepoint.com/sites/Mabicons/recruitment")
         self.access_token: Optional[str] = None
 
