@@ -857,6 +857,54 @@ async def stream_candidate_pdf(candidate_id: str):
 
 
 @app.get(
+    "/api/v1/debug-sharepoint/{candidate_id}",
+    tags=["Candidates"],
+)
+async def debug_sharepoint(candidate_id: str):
+    cand_info = _find_candidate_dict(candidate_id)
+    from api.sharepoint_service import sharepoint_service
+    token = sharepoint_service.get_token()
+    
+    source_url = cand_info.get("source_file_url") or cand_info.get("cv_path") or ""
+    name = cand_info.get("full_name") or cand_info.get("name") or ""
+    raw_filename = source_url.split("/")[-1] if "/" in source_url else name
+    
+    clean_raw = raw_filename.replace("_Candidate_Profile.pdf", "").replace(".pdf", "").replace(".docx", "").replace("%20", " ")
+    parts = [p.strip() for p in clean_raw.replace("[", "_").replace("]", "_").split("_") if p.strip()]
+    valid_parts = [p for p in parts if p.lower() not in ("naukri", "candidate", "profile", "cv", "resume", "updated", "master") and len(p) >= 3]
+    clean_q = valid_parts[0] if valid_parts else (parts[0] if parts else clean_raw[:20])
+
+    res_info = {
+        "candidate_id": candidate_id,
+        "cand_info_name": cand_info.get("full_name"),
+        "source_url": source_url,
+        "clean_q": clean_q,
+        "token_acquired": bool(token),
+        "token_length": len(token) if token else 0,
+        "tenant_id": sharepoint_service.tenant_id,
+        "client_id": sharepoint_service.client_id,
+    }
+
+    if token:
+        drive_id = "b!t27jau6RfUy2TTNQR9xrY4fl0GxEWbZOiKBX1DOm7G3JxaXUQevlQZcWsrDM0tIp"
+        headers = {"Authorization": f"Bearer {token}"}
+        search_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/search(q='{clean_q}')"
+        try:
+            r = requests.get(search_url, headers=headers, timeout=10)
+            res_info["search_status"] = r.status_code
+            if r.ok:
+                items = r.json().get("value", [])
+                res_info["items_found"] = len(items)
+                if items:
+                    res_info["first_item_name"] = items[0].get("name")
+                    res_info["first_item_size"] = items[0].get("size")
+        except Exception as e:
+            res_info["search_error"] = str(e)
+            
+    return res_info
+
+
+@app.get(
     "/api/v1/candidates/{candidate_id}",
     tags=["Candidates"],
     summary="Get single candidate detail profile by ID",
