@@ -124,13 +124,17 @@ class MabiconsSharePointService:
             if res.ok:
                 items = res.json().get("value", [])
                 best_item = None
-                for item in items:
+                # Prioritize original resume files (exclude generated index _Candidate_Profile.pdf files)
+                original_items = [i for i in items if not i.get("name", "").lower().endswith("_candidate_profile.pdf")]
+                candidates_to_check = original_items if original_items else items
+                
+                for item in candidates_to_check:
                     item_name = item.get("name", "")
                     if clean_q.lower() in item_name.lower():
                         best_item = item
                         break
-                if not best_item and items:
-                    best_item = items[0]
+                if not best_item and candidates_to_check:
+                    best_item = candidates_to_check[0]
 
                 if best_item:
                     item_id = best_item.get("id")
