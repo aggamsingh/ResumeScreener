@@ -112,6 +112,15 @@ class MabiconsSharePointService:
         search_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/search(q='{clean_q}')"
         try:
             res = requests.get(search_url, headers=headers, timeout=12)
+            if res.status_code == 401:
+                logger.info("Graph API token expired or invalid; resetting token cache and retrying...")
+                self.access_token = None
+                token = self.get_token()
+                if not token:
+                    return None
+                headers = {"Authorization": f"Bearer {token}"}
+                res = requests.get(search_url, headers=headers, timeout=12)
+
             if res.ok:
                 items = res.json().get("value", [])
                 best_item = None
@@ -136,6 +145,8 @@ class MabiconsSharePointService:
                     if content_res.ok and content_res.content.startswith(b"%PDF"):
                         logger.info("Successfully streamed original candidate resume binary (%d bytes) from SharePoint for '%s'", len(content_res.content), item_name)
                         return content_res.content
+            else:
+                logger.warning("Graph API drive search returned HTTP %d for query '%s'", res.status_code, clean_q)
         except Exception as e:
             logger.warning("Error fetching file content from SharePoint Graph API: %s", e)
         return None
