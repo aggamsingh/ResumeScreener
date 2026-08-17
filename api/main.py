@@ -1226,25 +1226,23 @@ Assistant:"""
             q_client = getattr(request.app.state, "qdrant", None)
             if q_client is None:
                 try:
-                    q_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=3)
+                    q_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=2)
                     q_client.get_collections()
                 except Exception:
-                    try:
-                        q_client = QdrantClient(path="./data/qdrant_db")
-                    except Exception:
-                        q_client = QdrantClient(":memory:")
+                    q_client = QdrantClient(":memory:")
                 request.app.state.qdrant = q_client
 
+            emb_model = get_embedding_model(request)
             raw_candidates, _ = retrieve_candidates(
                 qdrant_client=q_client,
-                model=get_embedding_model(request),
+                model=emb_model,
                 jd_text=refined_search_query,
                 collection_name=settings.qdrant_collection,
                 top_n=requested_count * 2,
                 filters=chat_filters,
             )
         except Exception as exc:
-            logger.error("Chat candidate retrieval failed: %s", exc, exc_info=True)
+            logger.warning("Vector candidate retrieval skipped/failed: %s", exc)
             raw_candidates = []
 
         # Exactly requested_count candidates matching experience filter criteria
@@ -1269,65 +1267,64 @@ Assistant:"""
 
         # If vector retrieval yields fewer candidates, supplement from PostgreSQL resume database with SQL criteria
         if len(candidates) < requested_count:
-            try:
-                import psycopg2  # type: ignore
-                pg_url = os.getenv("DATABASE_URL") or "postgresql://postgres:root@localhost:5432/resume_lens"
-                conn = psycopg2.connect(pg_url)
-                cur = conn.cursor()
+            pg_url = os.getenv("DATABASE_URL", "").strip()
+            if pg_url and "localhost" not in pg_url:
+                try:
+                    import psycopg2  # type: ignore
+                    conn = psycopg2.connect(pg_url, connect_timeout=2)
+                    cur = conn.cursor()
 
-                sql = 'SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes'
-                where_clauses = []
-                sql_params = []
+                    sql = 'SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes'
+                    where_clauses = []
+                    sql_params = []
 
-                if min_exp is not None:
-                    where_clauses.append("years_experience >= %s")
-                    sql_params.append(min_exp)
-                if max_exp is not None:
-                    where_clauses.append("years_experience <= %s")
-                    sql_params.append(max_exp)
+                    if min_exp is not None:
+                        where_clauses.append("years_experience >= %s")
+                        sql_params.append(min_exp)
+                    if max_exp is not None:
+                        where_clauses.append("years_experience <= %s")
+                        sql_params.append(max_exp)
 
-                # Extract skill & qualification keywords from user search query
-                stop_words = {"who", "has", "have", "with", "for", "the", "and", "skills", "skill", "candidate", "candidates", "profile", "profiles", "resume", "resumes", "show", "top", "find", "looking", "need", "years", "yrs", "exp", "experience"}
-                query_keywords = [w.strip() for w in re.split(r'[\s,;/]+', user_combined_text.lower()) if len(w.strip()) > 2 and w.strip() not in stop_words]
+                    skill_clauses = []
+                    for kw in query_keywords:
+                        pattern = f"%{kw}%"
+                        skill_clauses.append('(skills::text ILIKE %s OR "current_role" ILIKE %s OR resume_text ILIKE %s OR full_name ILIKE %s)')
+                        sql_params.extend([pattern, pattern, pattern, pattern])
 
-                skill_clauses = []
-                for kw in query_keywords:
-                    pattern = f"%{kw}%"
-                    skill_clauses.append('(skills::text ILIKE %s OR "current_role" ILIKE %s OR resume_text ILIKE %s OR full_name ILIKE %s)')
-                    sql_params.extend([pattern, pattern, pattern, pattern])
+                    if skill_clauses:
+                        where_clauses.append("(" + " OR ".join(skill_clauses) + ")")
 
-                if skill_clauses:
-                    where_clauses.append("(" + " OR ".join(skill_clauses) + ")")
+                    if where_clauses:
+                        sql += " WHERE " + " AND ".join(where_clauses)
+                    sql += " ORDER BY years_experience DESC LIMIT %s"
+                    sql_params.append(requested_count * 2)
 
-                if where_clauses:
-                    sql += " WHERE " + " AND ".join(where_clauses)
-                sql += " ORDER BY years_experience DESC LIMIT %s"
-                sql_params.append(requested_count * 2)
+                    cur.execute(sql, tuple(sql_params))
+                    rows = cur.fetchall()
+                    conn.close()
 
-                cur.execute(sql, tuple(sql_params))
-                rows = cur.fetchall()
-                conn.close()
+                    existing_ids = {str(c.get("candidate_id")) for c in candidates}
+                    for r in rows:
+                        cid = str(r[0])
+                        if cid not in existing_ids:
+                            candidates.append({
+                                "candidate_id": cid,
+                                "name": r[1] or "Candidate Profile",
+                                "metadata": {
+                                    "experience_years": r[3],
+                                    "location": r[5] or "N/A",
+                                    "skills": r[2] or []
+                                },
+                                "best_chunk_text": (r[6] or "")[:800],
+                                "cv_path": r[7]
+                            })
+                            existing_ids.add(cid)
+                            if len(candidates) >= requested_count:
+                                break
+                except Exception as pg_err:
+                    logger.warning("PostgreSQL chat fallback failed: %s", pg_err)
 
-                existing_ids = {str(c.get("candidate_id")) for c in candidates}
-                for r in rows:
-                    cid = str(r[0])
-                    if cid not in existing_ids:
-                        candidates.append({
-                            "candidate_id": cid,
-                            "name": r[1] or "Candidate Profile",
-                            "metadata": {
-                                "experience_years": r[3],
-                                "location": r[5] or "N/A",
-                                "skills": r[2] or []
-                            },
-                            "best_chunk_text": (r[6] or "")[:800],
-                            "cv_path": r[7]
-                        })
-                        existing_ids.add(cid)
-                        if len(candidates) >= requested_count:
-                            break
-            except Exception as pg_err:
-                logger.warning("PostgreSQL chat fallback failed (%s). Falling back to canonical_candidates.json", pg_err)
+            if len(candidates) < requested_count:
                 try:
                     json_path = Path(__file__).parent / "canonical_candidates.json"
                     if json_path.exists():
