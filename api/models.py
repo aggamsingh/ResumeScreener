@@ -5,7 +5,7 @@ Pydantic models for request validation and response serialization.
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -228,8 +228,8 @@ class ChatHistoryItem(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(description="User prompt / question")
-    history: Optional[list[ChatHistoryItem]] = Field(default=[], description="Previous chat messages")
+    message: str = Field(default="", description="User prompt / question")
+    history: Optional[list[Any]] = Field(default=[], description="Previous chat messages")
 
 
 class ChatResponse(BaseModel):
