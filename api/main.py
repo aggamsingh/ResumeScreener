@@ -1222,135 +1222,65 @@ Assistant:"""
         search_terms = [m for m in user_messages if not re.search(r'^(?:show\s*|top\s*)?\d+\s*(?:candidates|results)?$', m, re.IGNORECASE)]
         refined_search_query = " ".join(search_terms) if search_terms else user_combined_text
 
-        raw_candidates = []
-        if getattr(request.app.state, "model", None) is not None:
-            try:
-                q_client = getattr(request.app.state, "qdrant", None)
-                if q_client:
-                    raw_candidates, _ = retrieve_candidates(
-                        qdrant_client=q_client,
-                        model=request.app.state.model,
-                        jd_text=refined_search_query,
-                        collection_name=settings.qdrant_collection,
-                        top_n=requested_count * 2,
-                        filters=chat_filters,
-                    )
-            except Exception as exc:
-                logger.warning("Vector candidate retrieval skipped/failed: %s", exc)
-
-        # Exactly requested_count candidates matching experience filter criteria
-        candidates = [build_candidate_response(c) for c in raw_candidates]
-        if min_exp is not None:
-            candidates = [c for c in candidates if (c.get("metadata", {}).get("experience_years") if isinstance(c.get("metadata"), dict) else getattr(c.get("metadata"), "experience_years", 0) or 0) >= min_exp]
-        if max_exp is not None:
-            candidates = [c for c in candidates if (c.get("metadata", {}).get("experience_years") if isinstance(c.get("metadata"), dict) else getattr(c.get("metadata"), "experience_years", 0) or 0) <= max_exp]
-
-        # Extract skill & qualification keywords from user search query
         stop_words = {"who", "has", "have", "with", "for", "the", "and", "skills", "skill", "candidate", "candidates", "profile", "profiles", "resume", "resumes", "show", "top", "find", "looking", "need", "years", "yrs", "exp", "experience"}
         query_keywords = [w.strip() for w in re.split(r'[\s,;/]+', user_combined_text.lower()) if len(w.strip()) > 2 and w.strip() not in stop_words]
 
-        # Enforce qualification matching on vector results: candidate text must contain at least one requested skill keyword
-        if query_keywords:
-            qualified_cands = []
-            for c in candidates:
-                cand_text = f"{c.get('name', '')} {c.get('best_chunk_text', '')} {' '.join(c.get('metadata', {}).get('skills', []))}".lower()
-                if any(kw in cand_text for kw in query_keywords):
-                    qualified_cands.append(c)
-            candidates = qualified_cands
+        candidates = []
+        try:
+            json_path = Path(__file__).parent / "canonical_candidates.json"
+            if json_path.exists():
+                with open(json_path, "r", encoding="utf-8") as f:
+                    json_cands = json.load(f)
 
-        # If vector retrieval yields fewer candidates, supplement from PostgreSQL resume database with SQL criteria
-        if len(candidates) < requested_count:
-            pg_url = os.getenv("DATABASE_URL", "").strip()
-            if pg_url and "localhost" not in pg_url:
-                try:
-                    import psycopg2  # type: ignore
-                    conn = psycopg2.connect(pg_url, connect_timeout=2)
-                    cur = conn.cursor()
+                for c in json_cands:
+                    exp = c.get("years_experience", 0)
+                    if min_exp is not None and exp < min_exp:
+                        continue
+                    if max_exp is not None and exp > max_exp:
+                        continue
+                    cand_text = f"{c.get('full_name', '')} {c.get('resume_text', '')} {' '.join(c.get('skills', []) or [])}".lower()
+                    if query_keywords and not any(kw in cand_text for kw in query_keywords):
+                        continue
+                    candidates.append({
+                        "candidate_id": str(c.get("id")),
+                        "name": c.get("full_name"),
+                        "metadata": {
+                            "experience_years": exp,
+                            "location": c.get("location") or "N/A",
+                            "skills": c.get("skills") or []
+                        },
+                        "best_chunk_text": (c.get("resume_text") or "")[:800],
+                        "cv_path": c.get("source_file_url")
+                    })
+                    if len(candidates) >= requested_count:
+                        break
 
-                    sql = 'SELECT id, full_name, skills, years_experience, "current_role", location, resume_text, source_file_url FROM resumes'
-                    where_clauses = []
-                    sql_params = []
-
-                    if min_exp is not None:
-                        where_clauses.append("years_experience >= %s")
-                        sql_params.append(min_exp)
-                    if max_exp is not None:
-                        where_clauses.append("years_experience <= %s")
-                        sql_params.append(max_exp)
-
-                    skill_clauses = []
-                    for kw in query_keywords:
-                        pattern = f"%{kw}%"
-                        skill_clauses.append('(skills::text ILIKE %s OR "current_role" ILIKE %s OR resume_text ILIKE %s OR full_name ILIKE %s)')
-                        sql_params.extend([pattern, pattern, pattern, pattern])
-
-                    if skill_clauses:
-                        where_clauses.append("(" + " OR ".join(skill_clauses) + ")")
-
-                    if where_clauses:
-                        sql += " WHERE " + " AND ".join(where_clauses)
-                    sql += " ORDER BY years_experience DESC LIMIT %s"
-                    sql_params.append(requested_count * 2)
-
-                    cur.execute(sql, tuple(sql_params))
-                    rows = cur.fetchall()
-                    conn.close()
-
+                if len(candidates) < requested_count:
                     existing_ids = {str(c.get("candidate_id")) for c in candidates}
-                    for r in rows:
-                        cid = str(r[0])
+                    for c in json_cands:
+                        cid = str(c.get("id"))
                         if cid not in existing_ids:
+                            exp = c.get("years_experience", 0)
+                            if min_exp is not None and exp < min_exp:
+                                continue
+                            if max_exp is not None and exp > max_exp:
+                                continue
                             candidates.append({
                                 "candidate_id": cid,
-                                "name": r[1] or "Candidate Profile",
+                                "name": c.get("full_name"),
                                 "metadata": {
-                                    "experience_years": r[3],
-                                    "location": r[5] or "N/A",
-                                    "skills": r[2] or []
+                                    "experience_years": exp,
+                                    "location": c.get("location") or "N/A",
+                                    "skills": c.get("skills") or []
                                 },
-                                "best_chunk_text": (r[6] or "")[:800],
-                                "cv_path": r[7]
+                                "best_chunk_text": (c.get("resume_text") or "")[:800],
+                                "cv_path": c.get("source_file_url")
                             })
                             existing_ids.add(cid)
                             if len(candidates) >= requested_count:
                                 break
-                except Exception as pg_err:
-                    logger.warning("PostgreSQL chat fallback failed: %s", pg_err)
-
-            if len(candidates) < requested_count:
-                try:
-                    json_path = Path(__file__).parent / "canonical_candidates.json"
-                    if json_path.exists():
-                        with open(json_path, "r", encoding="utf-8") as f:
-                            json_cands = json.load(f)
-                        existing_ids = {str(c.get("candidate_id")) for c in candidates}
-                        for c in json_cands:
-                            cid = str(c.get("id"))
-                            if cid not in existing_ids:
-                                exp = c.get("years_experience", 0)
-                                if min_exp is not None and exp < min_exp:
-                                    continue
-                                if max_exp is not None and exp > max_exp:
-                                    continue
-                                cand_text = f"{c.get('full_name', '')} {c.get('resume_text', '')} {' '.join(c.get('skills', []) or [])}".lower()
-                                if query_keywords and not any(kw in cand_text for kw in query_keywords):
-                                    continue
-                                candidates.append({
-                                    "candidate_id": cid,
-                                    "name": c.get("full_name"),
-                                    "metadata": {
-                                        "experience_years": exp,
-                                        "location": c.get("location") or "N/A",
-                                        "skills": c.get("skills") or []
-                                    },
-                                    "best_chunk_text": (c.get("resume_text") or "")[:800],
-                                    "cv_path": c.get("source_file_url")
-                                })
-                                existing_ids.add(cid)
-                                if len(candidates) >= requested_count:
-                                    break
-                except Exception as json_err:
-                    logger.warning("JSON fallback error: %s", json_err)
+        except Exception as json_err:
+            logger.warning("Canonical JSON candidate lookup error: %s", json_err)
 
         candidates = candidates[:requested_count]
         candidates_context = ""
