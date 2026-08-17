@@ -1233,21 +1233,29 @@ Assistant:"""
                     json_cands = json.load(f)
 
                 for c in json_cands:
-                    exp = c.get("years_experience", 0)
+                    exp = c.get("years_experience", 0) or 0
                     if min_exp is not None and exp < min_exp:
                         continue
                     if max_exp is not None and exp > max_exp:
                         continue
-                    cand_text = f"{c.get('full_name', '')} {c.get('resume_text', '')} {' '.join(c.get('skills', []) or [])}".lower()
+                    
+                    skills_raw = c.get('skills') or []
+                    if isinstance(skills_raw, list):
+                        skills_str = " ".join(str(s) for s in skills_raw if s)
+                    else:
+                        skills_str = str(skills_raw)
+
+                    cand_text = f"{c.get('full_name') or ''} {c.get('resume_text') or ''} {skills_str}".lower()
                     if query_keywords and not any(kw in cand_text for kw in query_keywords):
                         continue
+
                     candidates.append({
                         "candidate_id": str(c.get("id")),
-                        "name": c.get("full_name"),
+                        "name": c.get("full_name") or "Candidate Profile",
                         "metadata": {
                             "experience_years": exp,
                             "location": c.get("location") or "N/A",
-                            "skills": c.get("skills") or []
+                            "skills": skills_raw if isinstance(skills_raw, list) else [skills_str]
                         },
                         "best_chunk_text": (c.get("resume_text") or "")[:800],
                         "cv_path": c.get("source_file_url")
