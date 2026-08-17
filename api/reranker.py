@@ -30,7 +30,7 @@ GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "4"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "12"))
 
 # Maximum candidates sent to the LLM in a single prompt.
 # With 800-char excerpts + metadata, 15 candidates fit comfortably in
