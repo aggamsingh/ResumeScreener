@@ -829,17 +829,22 @@ startxref
     summary="Stream raw candidate PDF document for direct original display inside site",
 )
 async def stream_candidate_pdf(candidate_id: str):
-    # 1. Try Graph API fetch if available
+    cand_info = _find_candidate_dict(candidate_id)
+    
+    # 1. Try fetching original candidate resume binary from SharePoint via Graph API
     try:
         from api.sharepoint_service import sharepoint_service
-        raw_bytes = sharepoint_service.fetch_file_content(candidate_id)
-        if raw_bytes:
-            return Response(content=raw_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
-    except Exception:
-        pass
+        raw_bytes = sharepoint_service.fetch_file_content(cand_info)
+        if raw_bytes and raw_bytes.startswith(b"%PDF"):
+            return Response(
+                content=raw_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": "inline; filename=resume.pdf"}
+            )
+    except Exception as e:
+        logger.warning("SharePoint raw binary fetch failed for %s: %s", candidate_id, e)
 
-    # 2. Get candidate detail from helper
-    cand_info = _find_candidate_dict(candidate_id)
+    # 2. Dynamic Fallback PDF stream
     pdf_bytes = generate_pdf_stream(
         name=cand_info.get("full_name") or cand_info.get("name"),
         role=cand_info.get("current_role"),
