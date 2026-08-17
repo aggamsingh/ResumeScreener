@@ -93,22 +93,15 @@ class MabiconsSharePointService:
             name = str(cand_info)
 
         raw_filename = source_url.split("/")[-1] if "/" in source_url else name
-        clean_filename = (
-            raw_filename.replace("_Candidate_Profile.pdf", "")
-            .replace(".pdf", "")
-            .replace(".docx", "")
-            .replace("%20", " ")
-        )
-        if not clean_filename or clean_filename.lower() in ("indexed candidate", "candidate profile", "n/a"):
-            clean_filename = str(name).split(" ")[0]
+        
+        # Smart Query Extraction
+        clean_raw = raw_filename.replace("_Candidate_Profile.pdf", "").replace(".pdf", "").replace(".docx", "").replace("%20", " ")
+        parts = [p.strip() for p in clean_raw.replace("[", "_").replace("]", "_").split("_") if p.strip()]
+        valid_parts = [p for p in parts if p.lower() not in ("naukri", "candidate", "profile", "cv", "resume", "updated", "master") and len(p) >= 3]
+        clean_q = valid_parts[0] if valid_parts else (parts[0] if parts else clean_raw[:20])
 
-        if not clean_filename:
+        if not clean_q:
             return None
-
-        # Search term query
-        clean_q = clean_filename.split("_")[0] if "_" in clean_filename else clean_filename
-        if len(clean_q) > 20:
-            clean_q = clean_q[:20]
 
         search_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/search(q='{clean_q}')"
         try:
@@ -118,7 +111,7 @@ class MabiconsSharePointService:
                 best_item = None
                 for item in items:
                     item_name = item.get("name", "")
-                    if clean_filename.lower() in item_name.lower() or item_name.lower().startswith(clean_q.lower()):
+                    if clean_q.lower() in item_name.lower():
                         best_item = item
                         break
                 if not best_item and items:
@@ -126,10 +119,16 @@ class MabiconsSharePointService:
 
                 if best_item:
                     item_id = best_item.get("id")
+                    item_name = best_item.get("name", "")
+                    is_docx = item_name.lower().endswith((".docx", ".doc"))
+                    
                     content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+                    if is_docx:
+                        content_url += "?format=pdf"
+                        
                     content_res = requests.get(content_url, headers=headers, timeout=15)
-                    if content_res.ok:
-                        logger.info("Successfully streamed original candidate resume binary (%d bytes) from SharePoint for '%s'", len(content_res.content), clean_filename)
+                    if content_res.ok and content_res.content.startswith(b"%PDF"):
+                        logger.info("Successfully streamed original candidate resume binary (%d bytes) from SharePoint for '%s'", len(content_res.content), item_name)
                         return content_res.content
         except Exception as e:
             logger.warning("Error fetching file content from SharePoint Graph API: %s", e)
