@@ -1080,7 +1080,6 @@ async def screen_resumes(
 )
 async def chat_agent(request: Request, body: ChatRequest):
     try:
-        return ChatResponse(reply="Test response", candidates=[])
         settings: Settings = getattr(request.app.state, "settings", None) or Settings()
         query_text = (body.message or "").strip()
 
