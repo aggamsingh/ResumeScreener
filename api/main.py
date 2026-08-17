@@ -620,12 +620,13 @@ async def get_candidate_by_id(candidate_id: str):
             with open(json_path, "r", encoding="utf-8") as f:
                 json_cands = json.load(f)
             for c in json_cands:
-                if str(c.get("id")) == str(candidate_id) or c.get("full_name") == candidate_id:
+                cand_id_str = str(c.get("id") or c.get("candidate_id") or "")
+                if cand_id_str == str(candidate_id) or c.get("full_name") == candidate_id or c.get("full_name", "").lower() == str(candidate_id).lower():
                     return {
-                        "id": str(c.get("id")),
-                        "candidate_id": str(c.get("id")),
-                        "full_name": c.get("full_name") or "Candidate Profile",
-                        "name": c.get("full_name") or "Candidate Profile",
+                        "id": str(c.get("id") or c.get("candidate_id")),
+                        "candidate_id": str(c.get("id") or c.get("candidate_id")),
+                        "full_name": c.get("full_name") or c.get("name") or "Candidate Profile",
+                        "name": c.get("full_name") or c.get("name") or "Candidate Profile",
                         "email": c.get("email") or "",
                         "phone": c.get("phone") or "",
                         "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
@@ -633,8 +634,8 @@ async def get_candidate_by_id(candidate_id: str):
                         "current_role": c.get("current_role") or "",
                         "location": c.get("location") or "N/A",
                         "resume_text": c.get("resume_text") or "",
-                        "source_file_url": c.get("source_file_url") or "",
-                        "cv_path": c.get("source_file_url") or "",
+                        "source_file_url": c.get("source_file_url") or c.get("cv_path") or "",
+                        "cv_path": c.get("source_file_url") or c.get("cv_path") or "",
                         "source": c.get("source") or "Mabicons SharePoint",
                         "sharepoint_site": c.get("sharepoint_site") or "Mabicons SharePoint",
                         "sharepoint_folder": c.get("sharepoint_folder") or "CV Database/Master CV/position wise",
