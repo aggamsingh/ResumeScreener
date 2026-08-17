@@ -70,6 +70,17 @@ class MabiconsSharePointService:
             except Exception as e:
                 logger.warning("Graph API query failed: %s", e)
 
-        return candidates
+    def fetch_file_content(self, file_id: str) -> Optional[bytes]:
+        token = self.get_token()
+        if token and file_id:
+            graph_url = f"https://graph.microsoft.com/v1.0/sites/mabicons.sharepoint.com:/sites/CVDatabase:/drive/items/{file_id}/content"
+            headers = {"Authorization": f"Bearer {token}"}
+            try:
+                r = requests.get(graph_url, headers=headers, timeout=15)
+                if r.ok:
+                    return r.content
+            except Exception as e:
+                logger.warning("Failed to fetch file content via Graph API: %s", e)
+        return None
 
 sharepoint_service = MabiconsSharePointService()
