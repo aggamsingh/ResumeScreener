@@ -608,89 +608,6 @@ async def list_all_candidates(
     return {"candidates": paged, "total": total_count}
 
 
-@app.get(
-    "/api/v1/candidates/{candidate_id}",
-    tags=["Candidates"],
-    summary="Get single candidate detail profile by ID",
-)
-async def get_candidate_by_id(candidate_id: str):
-    json_path = Path(__file__).parent / "canonical_candidates.json"
-    if json_path.exists():
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                json_cands = json.load(f)
-            for c in json_cands:
-                cand_id_str = str(c.get("id") or c.get("candidate_id") or "")
-                if cand_id_str == str(candidate_id) or c.get("full_name") == candidate_id or c.get("full_name", "").lower() == str(candidate_id).lower():
-                    return {
-                        "id": str(c.get("id") or c.get("candidate_id")),
-                        "candidate_id": str(c.get("id") or c.get("candidate_id")),
-                        "full_name": c.get("full_name") or c.get("name") or "Candidate Profile",
-                        "name": c.get("full_name") or c.get("name") or "Candidate Profile",
-                        "email": c.get("email") or "",
-                        "phone": c.get("phone") or "",
-                        "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
-                        "years_experience": c.get("years_experience", 0),
-                        "current_role": c.get("current_role") or "",
-                        "location": c.get("location") or "N/A",
-                        "resume_text": c.get("resume_text") or "",
-                        "source_file_url": c.get("source_file_url") or c.get("cv_path") or "",
-                        "cv_path": c.get("source_file_url") or c.get("cv_path") or "",
-                        "source": c.get("source") or "Mabicons SharePoint",
-                        "sharepoint_site": c.get("sharepoint_site") or "Mabicons SharePoint",
-                        "sharepoint_folder": c.get("sharepoint_folder") or "CV Database/Master CV/position wise",
-                    }
-        except Exception:
-            pass
-        # 2. Try Mabicons SharePoint Live Service
-    try:
-        from api.sharepoint_service import sharepoint_service
-        sp_cands = sharepoint_service.list_sharepoint_resumes(limit=200)
-        for c in sp_cands:
-            if str(c.get("candidate_id")) == str(candidate_id) or str(c.get("id")) == str(candidate_id):
-                return {
-                    "id": str(c.get("candidate_id")),
-                    "candidate_id": str(c.get("candidate_id")),
-                    "full_name": c.get("name") or "SharePoint Candidate",
-                    "name": c.get("name") or "SharePoint Candidate",
-                    "email": c.get("email") or "",
-                    "phone": c.get("phone") or "",
-                    "skills": c.get("skills") or ["SharePoint Indexed"],
-                    "years_experience": c.get("years_experience", 0),
-                    "current_role": c.get("current_role") or "Candidate",
-                    "location": c.get("location") or "India",
-                    "resume_text": c.get("resume_text") or "",
-                    "source_file_url": c.get("source_file_url") or "",
-                    "cv_path": c.get("source_file_url") or "",
-                    "source": "Mabicons SharePoint",
-                    "sharepoint_site": "Mabicons SharePoint",
-                    "sharepoint_folder": "CV Database/Master CV/position wise",
-                }
-    except Exception:
-        pass
-
-    # 3. Dynamic Fallback for requested candidate IDs
-    clean_id_name = str(candidate_id).replace("-", " ").title()
-    return {
-        "id": str(candidate_id),
-        "candidate_id": str(candidate_id),
-        "full_name": clean_id_name if len(clean_id_name) < 40 else "Indexed Candidate",
-        "name": clean_id_name if len(clean_id_name) < 40 else "Indexed Candidate",
-        "email": "",
-        "phone": "",
-        "skills": ["SharePoint Candidate", "Indexed Profile"],
-        "years_experience": 3,
-        "current_role": "Mabicons Candidate Profile",
-        "location": "India",
-        "resume_text": f"Candidate profile {candidate_id} indexed live from Mabicons SharePoint CV Database.",
-        "source_file_url": f"https://mabicons.sharepoint.com/sites/CVDatabase/Master%20CV/position%20wise/{candidate_id}.pdf",
-        "cv_path": f"https://mabicons.sharepoint.com/sites/CVDatabase/Master%20CV/position%20wise/{candidate_id}.pdf",
-        "source": "Mabicons SharePoint",
-        "sharepoint_site": "Mabicons SharePoint",
-        "sharepoint_folder": "CV Database/Master CV/position wise",
-    }
-
-
 def generate_pdf_stream(name: str, role: str, exp: int, location: str, skills: list, resume_text: str) -> bytes:
     name_str = str(name or "Candidate Profile").upper()
     role_str = str(role or "Candidate")
@@ -786,6 +703,89 @@ async def stream_candidate_pdf(candidate_id: str):
         resume_text=cand_info.get("resume_text", "")
     )
     return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}",
+    tags=["Candidates"],
+    summary="Get single candidate detail profile by ID",
+)
+async def get_candidate_by_id(candidate_id: str):
+    json_path = Path(__file__).parent / "canonical_candidates.json"
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                json_cands = json.load(f)
+            for c in json_cands:
+                cand_id_str = str(c.get("id") or c.get("candidate_id") or "")
+                if cand_id_str == str(candidate_id) or c.get("full_name") == candidate_id or c.get("full_name", "").lower() == str(candidate_id).lower():
+                    return {
+                        "id": str(c.get("id") or c.get("candidate_id")),
+                        "candidate_id": str(c.get("id") or c.get("candidate_id")),
+                        "full_name": c.get("full_name") or c.get("name") or "Candidate Profile",
+                        "name": c.get("full_name") or c.get("name") or "Candidate Profile",
+                        "email": c.get("email") or "",
+                        "phone": c.get("phone") or "",
+                        "skills": c.get("skills") if isinstance(c.get("skills"), list) else [],
+                        "years_experience": c.get("years_experience", 0),
+                        "current_role": c.get("current_role") or "",
+                        "location": c.get("location") or "N/A",
+                        "resume_text": c.get("resume_text") or "",
+                        "source_file_url": c.get("source_file_url") or c.get("cv_path") or "",
+                        "cv_path": c.get("source_file_url") or c.get("cv_path") or "",
+                        "source": c.get("source") or "Mabicons SharePoint",
+                        "sharepoint_site": c.get("sharepoint_site") or "Mabicons SharePoint",
+                        "sharepoint_folder": c.get("sharepoint_folder") or "CV Database/Master CV/position wise",
+                    }
+        except Exception:
+            pass
+        # 2. Try Mabicons SharePoint Live Service
+    try:
+        from api.sharepoint_service import sharepoint_service
+        sp_cands = sharepoint_service.list_sharepoint_resumes(limit=200)
+        for c in sp_cands:
+            if str(c.get("candidate_id")) == str(candidate_id) or str(c.get("id")) == str(candidate_id):
+                return {
+                    "id": str(c.get("candidate_id")),
+                    "candidate_id": str(c.get("candidate_id")),
+                    "full_name": c.get("name") or "SharePoint Candidate",
+                    "name": c.get("name") or "SharePoint Candidate",
+                    "email": c.get("email") or "",
+                    "phone": c.get("phone") or "",
+                    "skills": c.get("skills") or ["SharePoint Indexed"],
+                    "years_experience": c.get("years_experience", 0),
+                    "current_role": c.get("current_role") or "Candidate",
+                    "location": c.get("location") or "India",
+                    "resume_text": c.get("resume_text") or "",
+                    "source_file_url": c.get("source_file_url") or "",
+                    "cv_path": c.get("source_file_url") or "",
+                    "source": "Mabicons SharePoint",
+                    "sharepoint_site": "Mabicons SharePoint",
+                    "sharepoint_folder": "CV Database/Master CV/position wise",
+                }
+    except Exception:
+        pass
+
+    # 3. Dynamic Fallback for requested candidate IDs
+    clean_id_name = str(candidate_id).replace("-", " ").title()
+    return {
+        "id": str(candidate_id),
+        "candidate_id": str(candidate_id),
+        "full_name": clean_id_name if len(clean_id_name) < 40 else "Indexed Candidate",
+        "name": clean_id_name if len(clean_id_name) < 40 else "Indexed Candidate",
+        "email": "",
+        "phone": "",
+        "skills": ["SharePoint Candidate", "Indexed Profile"],
+        "years_experience": 3,
+        "current_role": "Mabicons Candidate Profile",
+        "location": "India",
+        "resume_text": f"Candidate profile {candidate_id} indexed live from Mabicons SharePoint CV Database.",
+        "source_file_url": f"https://mabicons.sharepoint.com/sites/CVDatabase/Master%20CV/position%20wise/{candidate_id}.pdf",
+        "cv_path": f"https://mabicons.sharepoint.com/sites/CVDatabase/Master%20CV/position%20wise/{candidate_id}.pdf",
+        "source": "Mabicons SharePoint",
+        "sharepoint_site": "Mabicons SharePoint",
+        "sharepoint_folder": "CV Database/Master CV/position wise",
+    }
 
 
 @app.post(
