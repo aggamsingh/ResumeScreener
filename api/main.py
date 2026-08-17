@@ -509,9 +509,9 @@ async def list_all_candidates(
     request: Request,
     limit: int = 200,
     offset: int = 0,
-    min_exp: Optional[int] = None,
-    max_exp: Optional[int] = None,
-    searchTerm: Optional[str] = None
+    min_exp: int = None,
+    max_exp: int = None,
+    searchTerm: str = None
 ):
     all_candidates = []
 
