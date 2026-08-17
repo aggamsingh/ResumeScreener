@@ -1223,8 +1223,20 @@ Assistant:"""
         refined_search_query = " ".join(search_terms) if search_terms else user_combined_text
 
         try:
+            q_client = getattr(request.app.state, "qdrant", None)
+            if q_client is None:
+                try:
+                    q_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=3)
+                    q_client.get_collections()
+                except Exception:
+                    try:
+                        q_client = QdrantClient(path="./data/qdrant_db")
+                    except Exception:
+                        q_client = QdrantClient(":memory:")
+                request.app.state.qdrant = q_client
+
             raw_candidates, _ = retrieve_candidates(
-                qdrant_client=request.app.state.qdrant,
+                qdrant_client=q_client,
                 model=get_embedding_model(request),
                 jd_text=refined_search_query,
                 collection_name=settings.qdrant_collection,
