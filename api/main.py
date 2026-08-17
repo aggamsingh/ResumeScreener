@@ -1339,6 +1339,9 @@ Assistant:"""
                                     continue
                                 if max_exp is not None and exp > max_exp:
                                     continue
+                                cand_text = f"{c.get('full_name', '')} {c.get('resume_text', '')} {' '.join(c.get('skills', []) or [])}".lower()
+                                if query_keywords and not any(kw in cand_text for kw in query_keywords):
+                                    continue
                                 candidates.append({
                                     "candidate_id": cid,
                                     "name": c.get("full_name"),
