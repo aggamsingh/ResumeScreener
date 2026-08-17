@@ -1081,7 +1081,14 @@ async def chat_agent(request: Request, body: ChatRequest):
 
         # 1. Parse ONLY user messages from history and current query
         history_list = body.history or []
-        user_messages = [str(h.content) for h in history_list if getattr(h, "role", "") == "user" and getattr(h, "content", None)] + ([query_text] if query_text else [])
+        user_messages = []
+        for h in history_list:
+            h_role = h.get("role") if isinstance(h, dict) else getattr(h, "role", None)
+            h_content = h.get("content") if isinstance(h, dict) else getattr(h, "content", None)
+            if h_role == "user" and h_content:
+                user_messages.append(str(h_content))
+        if query_text:
+            user_messages.append(query_text)
         user_combined_text = " ".join(user_messages)
         
         # 2. Classify intent: Candidate Search vs. General HR Assistant Deliverable
@@ -1099,8 +1106,10 @@ async def chat_agent(request: Request, body: ChatRequest):
             history_context = ""
             if body.history:
                 for item in body.history:
-                    role_name = "User" if item.role == "user" else "Assistant"
-                    history_context += f"{role_name}: {item.content}\n"
+                    i_role = item.get("role") if isinstance(item, dict) else getattr(item, "role", None)
+                    i_content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+                    role_name = "User" if i_role == "user" else "Assistant"
+                    history_context += f"{role_name}: {i_content}\n"
 
             prompt = f"""You are "Aryan", an elite autonomous AI HR Recruiter & Talent Acquisition Specialist at TalentMatch.
 The user is an HR recruiter requesting assistance with an HR task, email drafting, screening template, interview prep, policy guidance, or general consultation.
