@@ -1222,28 +1222,21 @@ Assistant:"""
         search_terms = [m for m in user_messages if not re.search(r'^(?:show\s*|top\s*)?\d+\s*(?:candidates|results)?$', m, re.IGNORECASE)]
         refined_search_query = " ".join(search_terms) if search_terms else user_combined_text
 
-        try:
-            q_client = getattr(request.app.state, "qdrant", None)
-            if q_client is None:
-                try:
-                    q_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=2)
-                    q_client.get_collections()
-                except Exception:
-                    q_client = QdrantClient(":memory:")
-                request.app.state.qdrant = q_client
-
-            emb_model = get_embedding_model(request)
-            raw_candidates, _ = retrieve_candidates(
-                qdrant_client=q_client,
-                model=emb_model,
-                jd_text=refined_search_query,
-                collection_name=settings.qdrant_collection,
-                top_n=requested_count * 2,
-                filters=chat_filters,
-            )
-        except Exception as exc:
-            logger.warning("Vector candidate retrieval skipped/failed: %s", exc)
-            raw_candidates = []
+        raw_candidates = []
+        if getattr(request.app.state, "model", None) is not None:
+            try:
+                q_client = getattr(request.app.state, "qdrant", None)
+                if q_client:
+                    raw_candidates, _ = retrieve_candidates(
+                        qdrant_client=q_client,
+                        model=request.app.state.model,
+                        jd_text=refined_search_query,
+                        collection_name=settings.qdrant_collection,
+                        top_n=requested_count * 2,
+                        filters=chat_filters,
+                    )
+            except Exception as exc:
+                logger.warning("Vector candidate retrieval skipped/failed: %s", exc)
 
         # Exactly requested_count candidates matching experience filter criteria
         candidates = [build_candidate_response(c) for c in raw_candidates]
