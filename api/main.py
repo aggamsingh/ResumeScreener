@@ -705,12 +705,7 @@ async def stream_candidate_pdf(candidate_id: str):
     return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
 
 
-@app.get(
-    "/api/v1/candidates/{candidate_id}",
-    tags=["Candidates"],
-    summary="Get single candidate detail profile by ID",
-)
-async def get_candidate_by_id(candidate_id: str):
+def _find_candidate_dict(candidate_id: str) -> dict:
     json_path = Path(__file__).parent / "canonical_candidates.json"
     if json_path.exists():
         try:
@@ -739,7 +734,7 @@ async def get_candidate_by_id(candidate_id: str):
                     }
         except Exception:
             pass
-        # 2. Try Mabicons SharePoint Live Service
+
     try:
         from api.sharepoint_service import sharepoint_service
         sp_cands = sharepoint_service.list_sharepoint_resumes(limit=200)
@@ -766,7 +761,6 @@ async def get_candidate_by_id(candidate_id: str):
     except Exception:
         pass
 
-    # 3. Dynamic Fallback for requested candidate IDs
     clean_id_name = str(candidate_id).replace("-", " ").title()
     return {
         "id": str(candidate_id),
@@ -786,6 +780,112 @@ async def get_candidate_by_id(candidate_id: str):
         "sharepoint_site": "Mabicons SharePoint",
         "sharepoint_folder": "CV Database/Master CV/position wise",
     }
+
+
+def generate_pdf_stream(name: str, role: str, exp: int, location: str, skills: list, resume_text: str) -> bytes:
+    name_str = str(name or "Candidate Profile").upper()
+    role_str = str(role or "Candidate")
+    exp_str = str(exp or 0)
+    loc_str = str(location or "N/A")
+    skills_str = ", ".join(skills) if isinstance(skills, list) else str(skills or "")
+    
+    text_content = f"RESUME - {name_str}\nRole: {role_str} | Experience: {exp_str} Yrs | Location: {loc_str}\nSkills: {skills_str}\n\n{resume_text}"
+    lines = text_content.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)").split("\n")
+    
+    stream_ops = []
+    stream_ops.append(f"BT /F1 14 Tf 40 760 Td ({name_str}) Tj ET")
+    stream_ops.append(f"BT /F2 10 Tf 40 740 Td (Role: {role_str}  |  Exp: {exp_str} Yrs  |  Location: {loc_str}) Tj ET")
+    if skills_str:
+        stream_ops.append(f"BT /F1 9 Tf 40 720 Td (Skills: {skills_str[:90]}) Tj ET")
+        
+    y = 695
+    for line in lines:
+        if not line.strip():
+            y -= 8
+            continue
+        clean_l = line.strip()[:100]
+        stream_ops.append(f"BT /F2 9 Tf 40 {y} Td ({clean_l}) Tj ET")
+        y -= 13
+        if y < 40:
+            break
+            
+    stream_body = "\n".join(stream_ops)
+    stream_len = len(stream_body.encode("utf-8", errors="ignore"))
+    
+    pdf = f"""%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Length {stream_len} >>
+stream
+{stream_body}
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000250 00000 n 
+0000000322 00000 n 
+0000000389 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+{400 + stream_len}
+%%EOF"""
+    return pdf.encode("utf-8", errors="ignore")
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}/pdf",
+    tags=["Candidates"],
+    summary="Stream raw candidate PDF document for direct original display inside site",
+)
+async def stream_candidate_pdf(candidate_id: str):
+    # 1. Try Graph API fetch if available
+    try:
+        from api.sharepoint_service import sharepoint_service
+        raw_bytes = sharepoint_service.fetch_file_content(candidate_id)
+        if raw_bytes:
+            return Response(content=raw_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
+    except Exception:
+        pass
+
+    # 2. Get candidate detail from helper
+    cand_info = _find_candidate_dict(candidate_id)
+    pdf_bytes = generate_pdf_stream(
+        name=cand_info.get("full_name") or cand_info.get("name"),
+        role=cand_info.get("current_role"),
+        exp=cand_info.get("years_experience"),
+        location=cand_info.get("location"),
+        skills=cand_info.get("skills"),
+        resume_text=cand_info.get("resume_text", "")
+    )
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
+
+
+@app.get(
+    "/api/v1/candidates/{candidate_id}",
+    tags=["Candidates"],
+    summary="Get single candidate detail profile by ID",
+)
+async def get_candidate_by_id(candidate_id: str):
+    return _find_candidate_dict(candidate_id)
 
 
 @app.post(
