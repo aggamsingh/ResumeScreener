@@ -9,7 +9,7 @@ Design principles:
   - Provider switched via LLM_PROVIDER env var ("groq" | "gemini")
   - Imports are lazy so the unused provider SDK never loads
 """
-from __future__ import annotations
+
 
 import json
 import logging

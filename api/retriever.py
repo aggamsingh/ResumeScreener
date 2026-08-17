@@ -18,7 +18,7 @@ Why post-retrieval filtering (not Qdrant-native filters):
     matching — adds schema complexity with no real benefit at 20k scale.
   - 30–90 candidate dicts filtered in Python is microseconds.
 """
-from __future__ import annotations
+
 
 import logging
 from typing import Any, Optional

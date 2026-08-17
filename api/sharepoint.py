@@ -2,7 +2,7 @@
 SharePoint Integrator & Downloader via Microsoft Graph API.
 Downloads candidate resumes from SharePoint folders directly into local storage.
 """
-from __future__ import annotations
+
 
 import logging
 import os
