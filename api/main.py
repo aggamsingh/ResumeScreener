@@ -1067,11 +1067,11 @@ async def chat_agent(request: Request, body: ChatRequest):
     """
     try:
         settings: Settings = getattr(request.app.state, "settings", None) or Settings()
-        query_text = body.message.strip()
+        query_text = (body.message or "").strip()
 
         # 1. Parse ONLY user messages from history and current query
         history_list = body.history or []
-        user_messages = [h.content for h in history_list if h.role == "user"] + [query_text]
+        user_messages = [str(h.content) for h in history_list if getattr(h, "role", "") == "user" and getattr(h, "content", None)] + ([query_text] if query_text else [])
         user_combined_text = " ".join(user_messages)
         
         # 2. Classify intent: Candidate Search vs. General HR Assistant Deliverable
