@@ -17,9 +17,9 @@ class MabiconsSharePointService:
         c = (os.getenv("SHAREPOINT_CLIENT_ID") or "").strip()
         s = (os.getenv("SHAREPOINT_CLIENT_SECRET") or "").strip()
 
-        self.tenant_id = t if len(t) > 10 else DEFAULT_TENANT
-        self.client_id = c if len(c) > 10 else DEFAULT_CLIENT
-        self.client_secret = s if len(s) > 10 else DEFAULT_SECRET
+        self.tenant_id = t if (len(t) > 15 and "your" not in t.lower()) else DEFAULT_TENANT
+        self.client_id = c if (len(c) > 15 and "your" not in c.lower()) else DEFAULT_CLIENT
+        self.client_secret = s if (len(s) > 15 and "your" not in s.lower()) else DEFAULT_SECRET
         self.site_url = os.getenv("SHAREPOINT_SITE_URL", "https://mabicons.sharepoint.com/sites/Mabicons/recruitment")
         self.access_token: Optional[str] = None
 
