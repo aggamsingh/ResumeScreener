@@ -1366,11 +1366,26 @@ Assistant:"""
                 f"- **Overview:** {cv_excerpt}\n"
             )
 
+        clean_cands = []
+        for c in candidates[:requested_count]:
+            meta = c.get("metadata", {}) if isinstance(c.get("metadata"), dict) else {}
+            skills_clean = [str(s) for s in (meta.get("skills") or []) if s] if isinstance(meta.get("skills"), list) else [str(meta.get("skills"))]
+            clean_cands.append({
+                "candidate_id": str(c.get("candidate_id") or ""),
+                "name": str(c.get("name") or "Candidate Profile"),
+                "metadata": {
+                    "experience_years": int(meta.get("experience_years") or 0),
+                    "location": str(meta.get("location") or "N/A"),
+                    "skills": skills_clean
+                },
+                "best_chunk_text": str(c.get("best_chunk_text") or "")[:800],
+                "cv_path": str(c.get("cv_path") or "")
+            })
+
         reply_lines.append("\nFeel free to ask me to filter further by specific skills, experience levels, or locations!")
-        return ChatResponse(reply="\n".join(reply_lines), candidates=candidates[:requested_count])
+        return ChatResponse(reply="\n".join(reply_lines), candidates=clean_cands)
     except Exception as chat_err:
-        import traceback
-        print("CHAT AGENT EXCEPTION TRACEBACK:\n", traceback.format_exc())
+        logger.error("Chat agent exception: %s", chat_err, exc_info=True)
         return ChatResponse(
             reply=f"I processed your query **\"{body.message}\"** and evaluated our candidate database. How many candidate profiles would you like to see?",
             candidates=[]
