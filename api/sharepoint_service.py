@@ -13,9 +13,13 @@ DEFAULT_SECRET = base64.b64decode("UEdoOFF+aFZBQTYubUtaMnAxVWNUbS0tQVFDcnJVTi53Z
 
 class MabiconsSharePointService:
     def __init__(self):
-        self.tenant_id = os.getenv("SHAREPOINT_TENANT_ID") or DEFAULT_TENANT
-        self.client_id = os.getenv("SHAREPOINT_CLIENT_ID") or DEFAULT_CLIENT
-        self.client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET") or DEFAULT_SECRET
+        t = (os.getenv("SHAREPOINT_TENANT_ID") or "").strip()
+        c = (os.getenv("SHAREPOINT_CLIENT_ID") or "").strip()
+        s = (os.getenv("SHAREPOINT_CLIENT_SECRET") or "").strip()
+
+        self.tenant_id = t if len(t) > 10 else DEFAULT_TENANT
+        self.client_id = c if len(c) > 10 else DEFAULT_CLIENT
+        self.client_secret = s if len(s) > 10 else DEFAULT_SECRET
         self.site_url = os.getenv("SHAREPOINT_SITE_URL", "https://mabicons.sharepoint.com/sites/Mabicons/recruitment")
         self.access_token: Optional[str] = None
 
