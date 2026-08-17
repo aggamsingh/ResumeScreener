@@ -677,34 +677,6 @@ startxref
     return pdf.encode("utf-8", errors="ignore")
 
 
-@app.get(
-    "/api/v1/candidates/{candidate_id}/pdf",
-    tags=["Candidates"],
-    summary="Stream raw candidate PDF document for direct original display inside site",
-)
-async def stream_candidate_pdf(candidate_id: str):
-    # 1. Try Graph API fetch if available
-    try:
-        from api.sharepoint_service import sharepoint_service
-        raw_bytes = sharepoint_service.fetch_file_content(candidate_id)
-        if raw_bytes:
-            return Response(content=raw_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
-    except Exception:
-        pass
-
-    # 2. Get candidate detail from canonical JSON
-    cand_info = await get_candidate_by_id(candidate_id)
-    pdf_bytes = generate_pdf_stream(
-        name=cand_info.get("full_name") or cand_info.get("name"),
-        role=cand_info.get("current_role"),
-        exp=cand_info.get("years_experience"),
-        location=cand_info.get("location"),
-        skills=cand_info.get("skills"),
-        resume_text=cand_info.get("resume_text", "")
-    )
-    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=resume.pdf"})
-
-
 def _find_candidate_dict(candidate_id: str) -> dict:
     json_path = Path(__file__).parent / "canonical_candidates.json"
     if json_path.exists():
