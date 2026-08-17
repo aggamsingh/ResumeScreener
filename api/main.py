@@ -824,7 +824,7 @@ startxref
 
 
 @app.get(
-    "/api/v1/candidates/{candidate_id}/pdf",
+    "/api/v1/candidate-pdf/{candidate_id}",
     tags=["Candidates"],
     summary="Stream raw candidate PDF document for direct original display inside site",
 )
