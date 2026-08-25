@@ -1057,7 +1057,7 @@ async def screen_resumes(
     try:
         raw_candidates, n_filtered_out = retrieve_candidates(
             qdrant_client=request.app.state.qdrant,
-            model=request.app.state.model,
+            model=get_embedding_model(request),
             jd_text=body.job_description,
             collection_name=settings.qdrant_collection,
             top_n=settings.retrieval_top_n,

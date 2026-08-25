@@ -322,36 +322,30 @@ def retrieve_candidates(
             actual_top_n,
         )
 
-    # ── Embed JD ─────────────────────────────────────────────────
-    logger.info("Embedding job description (%d chars)", len(jd_text))
-    jd_vector: list[float] = model.encode(jd_text).tolist()
-
     # ── Vector search ─────────────────────────────────────────────
-    logger.info(
-        "Querying Qdrant '%s' for top %d chunks",
-        collection_name,
-        actual_top_n,
-    )
+    hits = []
     try:
-        if hasattr(qdrant_client, "query_points"):
-            res = qdrant_client.query_points(
-                collection_name=collection_name,
-                query=jd_vector,
-                limit=actual_top_n,
-                with_payload=True,
-            )
-            hits = getattr(res, "points", res)
-        elif hasattr(qdrant_client, "search"):
-            hits = qdrant_client.search(
-                collection_name=collection_name,
-                query_vector=jd_vector,
-                limit=actual_top_n,
-                with_payload=True,
-            )
-        else:
-            hits = []
+        if model is not None:
+            logger.info("Embedding job description (%d chars)", len(jd_text))
+            jd_vector: list[float] = model.encode(jd_text).tolist()
+            logger.info("Querying Qdrant '%s' for top %d chunks", collection_name, actual_top_n)
+            if hasattr(qdrant_client, "query_points"):
+                res = qdrant_client.query_points(
+                    collection_name=collection_name,
+                    query=jd_vector,
+                    limit=actual_top_n,
+                    with_payload=True,
+                )
+                hits = getattr(res, "points", res)
+            elif hasattr(qdrant_client, "search"):
+                hits = qdrant_client.search(
+                    collection_name=collection_name,
+                    query_vector=jd_vector,
+                    limit=actual_top_n,
+                    with_payload=True,
+                )
     except Exception as e:
-        logger.warning("Qdrant search error or collection empty: %s", e)
+        logger.warning("Qdrant vector retrieval failed: %s", e)
         hits = []
 
     if not hits:
