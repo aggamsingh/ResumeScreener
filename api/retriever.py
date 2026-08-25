@@ -352,10 +352,47 @@ def retrieve_candidates(
             hits = []
     except Exception as e:
         logger.warning("Qdrant search error or collection empty: %s", e)
-        return [], 0
+        hits = []
 
     if not hits:
-        logger.warning("Qdrant returned zero results — is the collection indexed?")
+        logger.info("Qdrant returned zero hits — searching canonical SharePoint candidates database")
+        try:
+            from pathlib import Path
+            import json
+            json_p = Path(__file__).parent / "canonical_candidates.json"
+            if json_p.exists():
+                with open(json_p, "r", encoding="utf-8") as f:
+                    cands = json.load(f)
+                fallback_list = []
+                jd_lower = jd_text.lower()
+                keywords = [w for w in jd_lower.split() if len(w) > 2][:8]
+                for c in cands:
+                    c_id = str(c.get("id") or c.get("candidate_id") or "")
+                    name = c.get("full_name") or c.get("name") or "Candidate Profile"
+                    cv_url = c.get("source_file_url") or c.get("cv_path") or ""
+                    r_text = c.get("resume_text") or ""
+                    exp = c.get("years_experience", 0)
+                    skills = c.get("skills") if isinstance(c.get("skills"), list) else []
+                    
+                    matched_count = sum(1 for w in keywords if w in name.lower() or w in r_text[:500].lower() or any(w in s.lower() for s in skills))
+                    if matched_count > 0 or not keywords:
+                        score = min(0.95, 0.50 + (matched_count * 0.10))
+                        fallback_list.append({
+                            "candidate_id": c_id,
+                            "name": name,
+                            "cv_path": cv_url,
+                            "best_score": round(score, 2),
+                            "best_chunk_text": r_text[:500],
+                            "experience_years": exp,
+                            "location": c.get("location") or "India",
+                            "skills": skills,
+                            "email": c.get("email") or "",
+                        })
+                fallback_list.sort(key=lambda x: x["best_score"], reverse=True)
+                filtered_cands, n_out = _apply_filters(fallback_list[:actual_top_n], effective_filters)
+                return filtered_cands, n_out
+        except Exception as fb_err:
+            logger.warning("Canonical fallback error: %s", fb_err)
         return [], 0
 
     # ── Deduplicate & Hybrid Score ────────────────────────────────
