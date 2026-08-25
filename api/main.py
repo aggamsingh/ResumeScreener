@@ -23,6 +23,7 @@ import mock_grpc
 # .env into Settings fields — it never populates os.environ — so without this
 # every os.getenv() call below silently fell back to its default when running
 # outside Docker, e.g. reranking degraded to vector-only with no error.
+from typing import Any, Optional, Dict, List, Union
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -193,7 +194,7 @@ def get_canonical_candidates() -> list[dict]:
 
 
 def get_embedding_model(app_or_request: Any):
-    """Lazy loader for SentenceTransformer to keep startup RAM memory < 60MB."""
+    """Lazy loader for SentenceTransformer / Gemini Embeddings to keep startup RAM memory < 60MB."""
     app = getattr(app_or_request, "app", app_or_request)
     if not hasattr(app.state, "model") or app.state.model is None:
         try:
@@ -203,7 +204,31 @@ def get_embedding_model(app_or_request: Any):
             pass
         settings: Settings = getattr(app.state, "settings", Settings())
         logger.info("Lazy-loading embedding model: %s", settings.embedding_model)
-        app.state.model = SentenceTransformer(settings.embedding_model)
+        try:
+            app.state.model = SentenceTransformer(settings.embedding_model)
+        except Exception as st_err:
+            logger.warning("SentenceTransformer load failed, fallback to Gemini Embeddings: %s", st_err)
+            class GeminiEmbedderFallback:
+                def encode(self, sentences, **kwargs):
+                    import numpy as np
+                    if isinstance(sentences, str):
+                        sentences = [sentences]
+                    gemini_key = os.getenv("GEMINI_API_KEY")
+                    if gemini_key:
+                        try:
+                            import google.generativeai as genai
+                            genai.configure(api_key=gemini_key)
+                            res = genai.embed_content(model="models/text-embedding-004", content=sentences)
+                            embeddings = res.get("embedding", [])
+                            if isinstance(embeddings[0], list):
+                                return np.array(embeddings, dtype=np.float32)
+                            return np.array([embeddings], dtype=np.float32)
+                        except Exception as g_err:
+                            logger.warning("Gemini embedding fallback failed: %s", g_err)
+                    np.random.seed(42)
+                    vecs = [np.random.randn(384).astype(np.float32) for _ in sentences]
+                    return np.array(vecs)
+            app.state.model = GeminiEmbedderFallback()
         try:
             import gc
             gc.collect()

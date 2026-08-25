@@ -35,7 +35,8 @@ WORKDIR /app
 # sentence-transformers would otherwise pull in automatically.
 RUN pip install --no-cache-dir \
     torch \
-    --index-url https://download.pytorch.org/whl/cpu
+    --extra-index-url https://pypi.org/simple \
+    --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
