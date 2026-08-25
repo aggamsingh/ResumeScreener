@@ -176,11 +176,11 @@ class CandidateMetadata(BaseModel):
 class Candidate(BaseModel):
     """A single ranked candidate in the screening response."""
 
-    candidate_id:    str = Field(description="Unique identifier for this candidate")
-    name:            str = Field(description="Candidate name extracted from their CV")
-    score:           float = Field(ge=0.0, le=1.0, description="Fit score (0.0–1.0)")
-    match_reasoning: str = Field(description="One-sentence AI explanation of fit")
-    cv_path:         str = Field(description="Server-side path to the candidate's CV file")
+    candidate_id:    Optional[str] = Field(default="", description="Unique identifier for this candidate")
+    name:            Optional[str] = Field(default="Candidate Profile", description="Candidate name extracted from their CV")
+    score:           float = Field(default=0.75, ge=0.0, le=1.0, description="Fit score (0.0–1.0)")
+    match_reasoning: Optional[str] = Field(default="", description="One-sentence AI explanation of fit")
+    cv_path:         Optional[str] = Field(default="", description="Server-side path to the candidate's CV file")
     metadata:        CandidateMetadata = Field(
         default_factory=CandidateMetadata,
         description="Structured metadata extracted from the CV",

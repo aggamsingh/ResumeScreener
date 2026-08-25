@@ -307,23 +307,25 @@ def _apply_historical_feedback(candidates: list[dict[str, Any]]) -> list[dict[st
 def _fallback_ranking(candidates: list[dict[str, Any]], top_k: int) -> list[Candidate]:
     """Return candidates sorted by vector score + historical feedback boosts when LLM is unavailable."""
     candidates = _apply_historical_feedback(candidates)
-    sorted_candidates = sorted(candidates, key=lambda x: x.get("best_score", 0.0), reverse=True)
-    return [
-        Candidate(
-            candidate_id=c["candidate_id"],
-            name=c["name"],
-            # Clamp to [0.0, 1.0] — cosine scores can slightly exceed 1.0
-            # due to floating-point precision. Without clamping, Pydantic's
-            # le=1.0 constraint on Candidate.score raises a ValidationError,
-            # crashing the fallback path that is meant to be the safety net.
-            score=min(1.0, max(0.0, round(c["best_score"], 4))),
-            match_reasoning="Ranked by semantic similarity (AI reranker temporarily unavailable).",
-            cv_path=c["cv_path"],
-            metadata=CandidateMetadata(**c.get("metadata", {})),
-            filter_flags=c.get("filter_flags", []),
+    sorted_candidates = sorted(candidates, key=lambda x: float(x.get("best_score") or 0.0), reverse=True)
+    res = []
+    for c in sorted_candidates[:top_k]:
+        raw_meta = c.get("metadata")
+        meta_dict = raw_meta if isinstance(raw_meta, dict) else {}
+        score_val = float(c.get("best_score") or 0.75)
+        clamped_score = min(1.0, max(0.0, round(score_val, 4)))
+        res.append(
+            Candidate(
+                candidate_id=str(c.get("candidate_id") or c.get("id") or ""),
+                name=str(c.get("name") or "Candidate Profile"),
+                score=clamped_score,
+                match_reasoning="Ranked by semantic similarity (AI reranker temporarily unavailable).",
+                cv_path=str(c.get("cv_path") or c.get("source_file_url") or ""),
+                metadata=CandidateMetadata(**meta_dict),
+                filter_flags=c.get("filter_flags") if isinstance(c.get("filter_flags"), list) else [],
+            )
         )
-        for c in sorted_candidates[:top_k]
-    ]
+    return res
 
 
 def generate_llm_response(prompt: str, gemini_api_key_override: str | None = None) -> str:
