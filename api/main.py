@@ -1038,6 +1038,7 @@ async def screen_resumes(
       2. Reranks candidates using LLM (Gemini or Groq) with structured scoring.
     """
     job_id = str(uuid.uuid4())
+    top_k = body.top_k or 10
     settings: Settings = request.app.state.settings
     has_filters = body.filters is not None and body.filters.is_active()
 
