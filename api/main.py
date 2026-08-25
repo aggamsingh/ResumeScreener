@@ -1453,25 +1453,27 @@ async def log_candidate_feedback(body: CandidateFeedbackRequest):
 
 
 def run_sharepoint_sync_task(
+    app,
     body: SyncRequest,
     cv_folder_path: str,
     qdrant_client,
-    sentence_transformer_model,
     collection_name: str,
 ):
     logger.info("Starting background SharePoint sync and indexing task...")
+    status = getattr(app.state, "canonical_index_status", {})
+    status["running"] = True
+    status["error"] = None
     try:
         from pathlib import Path
         from indexer.parser import parse_file
         from indexer.utils import get_candidate_id
         from indexer.embedder import embed_and_upsert, ensure_collection
-
-        cv_dir = Path(cv_folder_path)
-        # rglob, not glob: CVs dropped into subfolders of cvs/ (the usual shape
-        # once SharePoint folders are mirrored) were previously never indexed.
-        # Extensions come from the parser so we never queue a file it will drop.
         from indexer.parser import SUPPORTED_EXTENSIONS
 
+        model = get_embedding_model(app)
+        vector_dim = getattr(model, "get_sentence_embedding_dimension", lambda: 384)()
+
+        cv_dir = Path(cv_folder_path)
         existing_files = [
             f for f in cv_dir.rglob("*")
             if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS and not f.name.startswith(".")
@@ -1479,7 +1481,6 @@ def run_sharepoint_sync_task(
 
         if existing_files:
             logger.info("Found %d existing local files. Indexing sequentially...", len(existing_files))
-            vector_dim = sentence_transformer_model.get_sentence_embedding_dimension()
             ensure_collection(qdrant_client, collection_name, vector_dim)
 
             for idx, cv_file in enumerate(existing_files, 1):
@@ -1487,23 +1488,25 @@ def run_sharepoint_sync_task(
                     cand_id = get_candidate_id(cv_file)
                     cv_obj = parse_file(cv_file, cand_id)
                     if cv_obj:
-                        embed_and_upsert(qdrant_client, sentence_transformer_model, cv_obj, collection_name)
+                        embed_and_upsert(qdrant_client, model, cv_obj, collection_name)
+                        status["processed"] = status.get("processed", 0) + 1
                         if idx % 10 == 0 or idx == len(existing_files):
                             logger.info("Indexed CV progress: %d/%d files", idx, len(existing_files))
                 except Exception as p_err:
+                    status["failed"] = status.get("failed", 0) + 1
                     logger.warning("Error parsing/indexing CV %s: %s", cv_file.name, p_err)
 
-        # Instant callback to index newly downloaded files immediately
         def on_download(file_path: Path):
             try:
                 cand_id = get_candidate_id(file_path)
                 cv_obj = parse_file(file_path, cand_id)
                 if cv_obj:
-                    vector_dim = sentence_transformer_model.get_sentence_embedding_dimension()
                     ensure_collection(qdrant_client, collection_name, vector_dim)
-                    embed_and_upsert(qdrant_client, sentence_transformer_model, cv_obj, collection_name)
+                    embed_and_upsert(qdrant_client, model, cv_obj, collection_name)
+                    status["processed"] = status.get("processed", 0) + 1
                     logger.info("Instantly indexed newly downloaded CV: %s", file_path.name)
             except Exception as index_err:
+                status["failed"] = status.get("failed", 0) + 1
                 logger.warning("Instant index failed for %s: %s", file_path.name, index_err)
 
         files_processed, new_downloaded = sync_sharepoint_resumes(
@@ -1516,9 +1519,15 @@ def run_sharepoint_sync_task(
             on_file_downloaded=on_download,
         )
 
+        status["total"] = files_processed
         logger.info("Background SharePoint sync completed. Files processed: %d, New downloaded: %d", files_processed, new_downloaded)
     except Exception as exc:
+        status["error"] = str(exc)
         logger.error("Background SharePoint sync task failed: %s", exc, exc_info=True)
+    finally:
+        status["running"] = False
+        from datetime import datetime, timezone
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 @app.post(
@@ -1535,10 +1544,6 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
     settings: Settings = request.app.state.settings
     cv_folder_path = getattr(settings, "cv_folder_path", "./cvs")
 
-    # Validate credentials, site and write access up front. The download loop
-    # still runs in the background, but a bad tenant/secret/site_url now fails
-    # the request instead of returning "success" while the real error is buried
-    # in the server log where the caller never sees it.
     try:
         creds = (
             body.tenant_id or sharepoint.DEFAULT_TENANT_ID,
@@ -1581,10 +1586,10 @@ async def sync_sharepoint_endpoint(request: Request, body: SyncRequest, backgrou
     background_tasks.add_task(
         asyncio.to_thread,
         run_sharepoint_sync_task,
+        app=request.app,
         body=body,
         cv_folder_path=cv_folder_path,
         qdrant_client=request.app.state.qdrant,
-        sentence_transformer_model=request.app.state.model,
         collection_name=settings.qdrant_collection,
     )
     return SyncResponse(

@@ -148,17 +148,28 @@ def sync_sharepoint_resumes(
             f"No document libraries found in the target SharePoint site "
             f"(Graph {drives_res.status_code}): {drives_res.text}"
         )
-    drive_id = drives[0]["id"]
-    logger.info("Using document library '%s'", drives[0].get("name"))
+
+    # Match drive by name if root_folder starts with a drive name, else use first drive
+    selected_drive = drives[0]
+    matched_subfolder = root_folder
+    for d in drives:
+        d_name = d.get("name", "").strip()
+        if d_name and root_folder.lower().startswith(d_name.lower()):
+            selected_drive = d
+            matched_subfolder = root_folder[len(d_name):].lstrip("/")
+            break
+
+    drive_id = selected_drive["id"]
+    logger.info("Using document library '%s' (ID: %s), scan subfolder: '%s'", selected_drive.get("name"), drive_id, matched_subfolder)
 
     files_processed = 0
     new_downloaded = 0
 
     def _children_url(folder: str) -> str:
-        # Graph addresses the library root differently from a subfolder.
+        clean_f = folder.strip("/")
         return (
-            f"{GRAPH}/drives/{drive_id}/root:/{folder}:/children"
-            if folder
+            f"{GRAPH}/drives/{drive_id}/root:/{clean_f}:/children"
+            if clean_f
             else f"{GRAPH}/drives/{drive_id}/root/children"
         )
 
@@ -166,17 +177,20 @@ def sync_sharepoint_resumes(
         nonlocal files_processed, new_downloaded
 
         url = _children_url(folder)
+        retry_root = False
         while url:
             resp = requests.get(url, headers=headers, timeout=15)
             if not resp.ok:
-                # Previously this returned silently, so a wrong folder path looked
-                # identical to an empty folder: "0 files processed", no explanation.
-                logger.error(
+                logger.warning(
                     "Cannot list SharePoint folder '%s' (Graph %s): %s",
                     folder or "<library root>",
                     resp.status_code,
                     resp.text,
                 )
+                if folder and not retry_root:
+                    logger.info("Retrying scan from Document Library root ''...")
+                    retry_root = True
+                    _download_folder("", position_tag)
                 return
 
             body = resp.json()
@@ -222,8 +236,8 @@ def sync_sharepoint_resumes(
             # tail of every large CV folder was silently never downloaded.
             url = body.get("@odata.nextLink")
 
-    logger.info("Scanning SharePoint path: %s", root_folder or "<library root>")
-    _download_folder(root_folder)
+    logger.info("Scanning SharePoint path: %s", matched_subfolder or "<library root>")
+    _download_folder(matched_subfolder)
 
     logger.info(
         "SharePoint sync completed: %d files processed, %d new CVs downloaded",
